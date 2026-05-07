@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>dotnet-TeamActivity.Processor-b7c460af-80f0-4fc9-bd26-77073e60b54c</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
+    <PackageReference Include="MQTTnet" Version="5.1.0.1559" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\TeamActivity.ServiceDefaults\TeamActivity.ServiceDefaults.csproj" />
+    <ProjectReference Include="..\TeamActivity.Shared.Contracts\TeamActivity.Shared.Contracts.csproj" />
+  </ItemGroup>
+</Project>

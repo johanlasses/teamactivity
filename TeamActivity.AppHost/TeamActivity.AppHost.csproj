@@ -1,0 +1,18 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.3.0">
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\TeamActivity.Publisher\TeamActivity.Publisher.csproj" />
+    <ProjectReference Include="..\src\TeamActivity.Processor\TeamActivity.Processor.csproj" />
+    <ProjectReference Include="..\src\TeamActivity.Judge\TeamActivity.Judge.csproj" />
+    <ProjectReference Include="..\src\TeamActivity.Scoreboard\TeamActivity.Scoreboard.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>2282b959-85ce-401f-93b7-c65e1eada177</UserSecretsId>
+  </PropertyGroup>
+
+</Project>

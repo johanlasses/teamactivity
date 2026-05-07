@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+.DS_Store
+TestResults/
+playwright-report/
+*.user
+*.suo
+*.log
