@@ -124,8 +124,7 @@ public sealed class Worker(
                     continue;
                 }
 
-                var dueAt = key.WindowEndUtc.AddSeconds(challenge.GraceSeconds);
-                if (now >= dueAt)
+                if (now >= key.WindowEndUtc)
                 {
                     publishedWindows.Add(key);
                     due.Add((key, aggregate));
