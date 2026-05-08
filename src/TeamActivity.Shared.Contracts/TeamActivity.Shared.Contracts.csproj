@@ -4,6 +4,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>TeamActivity.Shared.Contracts</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>MQTT AI Battle</Authors>
+    <Description>Shared MQTT topic contracts and message types for the MQTT AI Battle event. Teams reference this package to implement Publisher and Processor services.</Description>
   </PropertyGroup>
 
 </Project>

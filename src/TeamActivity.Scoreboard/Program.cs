@@ -86,7 +86,7 @@ internal static class ScoreboardPage
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MQTT Telemetry Gauntlet Scoreboard</title>
+  <title>MQTT AI Battle Scoreboard</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 2rem; color: #1f2937; }
     table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
@@ -97,8 +97,8 @@ internal static class ScoreboardPage
   </style>
 </head>
 <body>
-  <h1>MQTT Telemetry Gauntlet</h1>
-  <p class="muted">Phase 1 scoreboard: transport and contract visibility only. Full scoring lands in phase 2.</p>
+  <h1>MQTT AI Battle</h1>
+  <p class="muted">Live scoreboard — aggregate results scored in real time by the Judge.</p>
   <h2>Leaderboard</h2>
   <table>
     <thead>

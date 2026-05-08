@@ -3,8 +3,6 @@
   <ItemGroup>
     <ProjectReference Include="..\src\TeamActivity.Publisher\TeamActivity.Publisher.csproj" />
     <ProjectReference Include="..\src\TeamActivity.Processor\TeamActivity.Processor.csproj" />
-    <ProjectReference Include="..\src\TeamActivity.Judge\TeamActivity.Judge.csproj" />
-    <ProjectReference Include="..\src\TeamActivity.Scoreboard\TeamActivity.Scoreboard.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
