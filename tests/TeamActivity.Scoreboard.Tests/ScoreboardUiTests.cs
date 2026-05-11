@@ -53,7 +53,7 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
             WaitUntil = WaitUntilState.NetworkIdle
         });
 
-        await ExpectText(page, "MQTT Telemetry Gauntlet");
+        await ExpectText(page, "MQTT AI Battle");
         await page.WaitForFunctionAsync(
             "() => document.body.innerText.includes('team-template') && document.body.innerText.includes('run-template')",
             new PageWaitForFunctionOptions { Timeout = 15_000 });

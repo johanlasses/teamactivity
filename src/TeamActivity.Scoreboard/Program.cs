@@ -24,6 +24,11 @@ app.MapGet("/api/scores", async (JudgeClient judge, CancellationToken cancellati
     var scores = await judge.GetScores(cancellationToken);
     return Results.Json(scores);
 });
+app.MapGet("/api/chaos", async (JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    var chaos = await judge.GetChaos(cancellationToken);
+    return Results.Json(chaos);
+});
 
 app.Run();
 
@@ -39,6 +44,11 @@ internal sealed class JudgeClient(HttpClient httpClient)
     public async Task<IReadOnlyList<ScoreSnapshot>> GetScores(CancellationToken cancellationToken)
     {
         return await Measure(() => httpClient.GetFromJsonAsync<IReadOnlyList<ScoreSnapshot>>("/api/scores", cancellationToken), cancellationToken) ?? [];
+    }
+
+    public async Task<ChaosState?> GetChaos(CancellationToken cancellationToken)
+    {
+        return await Measure(() => httpClient.GetFromJsonAsync<ChaosState>("/api/chaos", cancellationToken), cancellationToken);
     }
 
     private static async Task<T?> Measure<T>(Func<Task<T?>> action, CancellationToken cancellationToken)
@@ -76,7 +86,20 @@ internal sealed record ScoreSnapshot(
     double LatencyP95Ms,
     double Score,
     DateTimeOffset LastUpdatedUtc,
-    string Status);
+    string Status,
+    int? DeviceCount,
+    int? MessageIntervalMs);
+
+internal sealed record ChaosState(
+    bool Enabled,
+    string? RunId,
+    ActiveChaosEvent? ActiveEvent);
+
+internal sealed record ActiveChaosEvent(
+    string Id,
+    string Type,
+    string Description,
+    DateTimeOffset StartedAtUtc);
 
 internal static class ScoreboardPage
 {
@@ -94,10 +117,15 @@ internal static class ScoreboardPage
     th { background: #f9fafb; }
     .muted { color: #6b7280; }
     .bad { color: #b91c1c; font-weight: 600; }
+    #chaos-banner { display: none; padding: .75rem 1.25rem; border-radius: .5rem; margin-bottom: 1.5rem; font-weight: 600; font-size: 1.1rem; }
+    #chaos-banner.armed { display: block; background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+    #chaos-banner.active { display: block; background: #fee2e2; color: #991b1b; border: 2px solid #f87171; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .7; } }
   </style>
 </head>
 <body>
   <h1>MQTT AI Battle</h1>
+  <div id="chaos-banner"></div>
   <p class="muted">Live scoreboard — aggregate results scored in real time by the Judge.</p>
   <h2>Leaderboard</h2>
   <table>
@@ -110,10 +138,12 @@ internal static class ScoreboardPage
         <th>Invalid</th>
         <th>Missing</th>
         <th>Latency p95 ms</th>
+        <th>Devices</th>
+        <th>Interval ms</th>
       </tr>
     </thead>
     <tbody id="scores">
-      <tr><td colspan="7" class="muted">Waiting for scores...</td></tr>
+      <tr><td colspan="9" class="muted">Waiting for scores...</td></tr>
     </tbody>
   </table>
   <h2>Observed messages</h2>
@@ -133,47 +163,85 @@ internal static class ScoreboardPage
     </tbody>
   </table>
   <script>
+    function esc(val) {
+      const el = document.createElement('span');
+      el.textContent = val ?? '';
+      return el.textContent;
+    }
+
     async function refresh() {
-      const [runsResponse, scoresResponse] = await Promise.all([
-        fetch('/api/runs'),
-        fetch('/api/scores')
+      const [runsResult, scoresResult, chaosResult] = await Promise.allSettled([
+        fetch('/api/runs').then(r => r.json()),
+        fetch('/api/scores').then(r => r.json()),
+        fetch('/api/chaos').then(r => r.json())
       ]);
-      const runs = await runsResponse.json();
-      const scores = await scoresResponse.json();
-      const body = document.getElementById('runs');
-      const scoresBody = document.getElementById('scores');
 
-      if (!scores.length) {
-        scoresBody.innerHTML = '<tr><td colspan="7" class="muted">No scores yet.</td></tr>';
+      if (chaosResult.status === 'fulfilled') {
+        updateChaosBanner(chaosResult.value);
+      }
+
+      if (scoresResult.status === 'fulfilled') {
+        const scores = scoresResult.value;
+        const scoresBody = document.getElementById('scores');
+        if (!scores.length) {
+          scoresBody.innerHTML = '<tr><td colspan="9" class="muted">No scores yet.</td></tr>';
+        } else {
+          scoresBody.innerHTML = scores.map(score => `
+            <tr>
+              <td>${esc(score.runId)}</td>
+              <td>${esc(score.teamId)}</td>
+              <td>${score.score.toFixed(2)}</td>
+              <td>${score.correct}</td>
+              <td class="${score.invalid ? 'bad' : ''}">${score.invalid}</td>
+              <td class="${score.missing ? 'bad' : ''}">${score.missing}</td>
+              <td>${score.latencyP95Ms.toFixed(0)}</td>
+              <td>${score.deviceCount ?? '—'}</td>
+              <td>${score.messageIntervalMs ?? '—'}</td>
+            </tr>
+          `).join('');
+        }
+      }
+
+      if (runsResult.status === 'fulfilled') {
+        const runs = runsResult.value;
+        const body = document.getElementById('runs');
+        if (!runs.length) {
+          body.innerHTML = '<tr><td colspan="6" class="muted">No runs observed yet.</td></tr>';
+        } else {
+          body.innerHTML = runs.map(run => `
+            <tr>
+              <td>${esc(run.runId)}</td>
+              <td>${run.teamIds.map(esc).join(', ')}</td>
+              <td>${run.messageCount}</td>
+              <td>${run.validMessageCount}</td>
+              <td class="${run.invalidMessageCount ? 'bad' : ''}">${run.invalidMessageCount}</td>
+              <td>${new Date(run.lastUpdatedUtc).toLocaleString()}</td>
+            </tr>
+          `).join('');
+        }
+      }
+    }
+
+    function updateChaosBanner(chaos) {
+      const banner = document.getElementById('chaos-banner');
+      banner.className = '';
+      banner.textContent = '';
+      if (!chaos || !chaos.enabled) return;
+      if (chaos.activeEvent) {
+        banner.className = 'active';
+        banner.textContent = '\uD83D\uDD25 CHAOS: ' + chaos.activeEvent.type.toUpperCase().replace(/-/g, ' ');
+        const desc = chaos.activeEvent.description;
+        if (desc) {
+          const small = document.createElement('span');
+          small.style.fontWeight = 'normal';
+          small.style.marginLeft = '.75rem';
+          small.textContent = desc;
+          banner.appendChild(small);
+        }
       } else {
-        scoresBody.innerHTML = scores.map(score => `
-          <tr>
-            <td>${score.runId}</td>
-            <td>${score.teamId}</td>
-            <td>${score.score.toFixed(2)}</td>
-            <td>${score.correct}</td>
-            <td class="${score.invalid ? 'bad' : ''}">${score.invalid}</td>
-            <td class="${score.missing ? 'bad' : ''}">${score.missing}</td>
-            <td>${score.latencyP95Ms.toFixed(0)}</td>
-          </tr>
-        `).join('');
+        banner.className = 'armed';
+        banner.textContent = '\u26A0\uFE0F Chaos Mode — disruptions may occur at any time';
       }
-
-      if (!runs.length) {
-        body.innerHTML = '<tr><td colspan="6" class="muted">No runs observed yet.</td></tr>';
-        return;
-      }
-
-      body.innerHTML = runs.map(run => `
-        <tr>
-          <td>${run.runId}</td>
-          <td>${run.teamIds.join(', ')}</td>
-          <td>${run.messageCount}</td>
-          <td>${run.validMessageCount}</td>
-          <td class="${run.invalidMessageCount ? 'bad' : ''}">${run.invalidMessageCount}</td>
-          <td>${new Date(run.lastUpdatedUtc).toLocaleString()}</td>
-        </tr>
-      `).join('');
     }
 
     refresh();

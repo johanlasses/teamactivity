@@ -18,6 +18,7 @@ public sealed class ScoringStore
     private readonly HashSet<WindowKey> missingWindows = [];
     private readonly Dictionary<(string RunId, string TeamId), ScoreState> scores = [];
     private readonly Dictionary<(string RunId, string TeamId), bool> completedRuns = [];
+    private readonly Dictionary<(string RunId, string TeamId), (int? DeviceCount, int? MessageIntervalMs)> runParams = [];
 
     public void ObserveTelemetry(TelemetryMessage telemetry, int windowSeconds)
     {
@@ -47,6 +48,11 @@ public sealed class ScoringStore
             if (control.Event == Topics.PublisherComplete)
             {
                 completedRuns[(control.RunId, control.TeamId)] = true;
+            }
+
+            if (control.Event == Topics.PublisherStart && (control.DeviceCount.HasValue || control.MessageIntervalMs.HasValue))
+            {
+                runParams[(control.RunId, control.TeamId)] = (control.DeviceCount, control.MessageIntervalMs);
             }
 
             TouchScore(control.RunId, control.TeamId);
@@ -190,10 +196,11 @@ public sealed class ScoringStore
         return score;
     }
 
-    private static ScoreSnapshot ToSnapshot(string runId, string teamId, ScoreState state)
+    private ScoreSnapshot ToSnapshot(string runId, string teamId, ScoreState state)
     {
         var latencyP95Ms = CalculateP95(state.LatenciesMs);
         var score = state.Correct - 5 * state.Invalid - 3 * state.Missing - 0.05 * latencyP95Ms;
+        runParams.TryGetValue((runId, teamId), out var rp);
         return new ScoreSnapshot(
             runId,
             teamId,
@@ -203,7 +210,9 @@ public sealed class ScoringStore
             latencyP95Ms,
             score,
             state.LastUpdatedUtc,
-            "Running");
+            "Running",
+            rp.DeviceCount,
+            rp.MessageIntervalMs);
     }
 
     private static double CalculateP95(IReadOnlyCollection<double> values)

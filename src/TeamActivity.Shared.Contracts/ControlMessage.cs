@@ -5,4 +5,9 @@ public sealed record ControlMessage(
     string RunId,
     string TeamId,
     string Event,
-    DateTimeOffset PublishedAtUtc);
+    DateTimeOffset PublishedAtUtc)
+{
+    public int? DeviceCount { get; init; }
+
+    public int? MessageIntervalMs { get; init; }
+}

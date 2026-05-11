@@ -263,14 +263,44 @@ The AppHost configures the Publisher with these defaults at startup:
 |---|---|---|
 | `runId` | `run-template` | Set via `ChallengeOptions` in appsettings |
 | `teamId` | `team-template` | Set via `ChallengeOptions` in appsettings |
-| `MessageCount` | `480` | Total telemetry messages per run |
-| `MessageIntervalMilliseconds` | `250` | Delay between messages → ~2 min total |
-| `DeviceCount` | `3` | Simulated devices (`device-001`, `device-002`, `device-003`) |
+| `MessageIntervalMilliseconds` | `250` | Delay between messages. Lower = more messages per second |
+| `DeviceCount` | `3` | Simulated devices (`device-001`, `device-002`, `device-003`). Higher = more parallelism |
 | `WindowSeconds` | `5` | Aggregation window size |
 | `GraceSeconds` | `2` | Grace period before Judge finalises a window |
 | `StartupDelaySeconds` | `3` | Publisher waits for Judge and Processor to be ready |
 
+**Message count is derived automatically.** The run window is fixed at 2 minutes (120 seconds). Total messages = `max(1, 120 000 / MessageIntervalMilliseconds)` using integer division. For example:
+- `250 ms` interval → **480 messages** across 3 devices (160 per device)
+- `100 ms` interval → **1 200 messages** across 3 devices (400 per device)
+- `50 ms` interval → **2 400 messages**
+
 **Each team must set their own `runId` and `teamId`** via environment variables or `appsettings.json` so their results appear separately on the Scoreboard.
+
+---
+
+## Chaos Events
+
+The event runs in **two phases**:
+
+1. **Normal run** — no disruptions. Teams tune and test their pipeline.
+2. **Chaos run** — the organiser may inject one or more disruptions mid-run. The Scoreboard shows an amber **"Chaos Mode"** banner when the phase starts, and a red live banner when a specific event is in progress.
+
+### Event Types
+
+| Type | What happens | What your Processor must handle |
+|---|---|---|
+| `processor-restart` | Your Processor service is killed and restarts mid-run | Reconnect to MQTT, recover in-progress window state, resume publishing results |
+| `message-burst` | Publisher briefly sends at a much faster rate | Dedup by `sequence`, avoid double-counting, handle backpressure |
+| `message-gap` | Publisher pauses sending for several seconds | Keep open windows alive; do not close/discard windows prematurely |
+| `device-dropout` | One device stops sending for a period | Finalise that device's windows with the data you have; don't block other devices |
+| `high-latency` | Artificial delay injected between publisher and broker | Tighten your latency margin; publish results before the 2-second grace period expires |
+
+### Resilience Tips
+
+- **MQTT reconnect:** Register a reconnect handler and re-subscribe to the raw telemetry topic on reconnect. All in-progress window state should survive the reconnect.
+- **State preservation across restarts:** Persist window aggregates to a fast local store (or re-derive from any buffered messages) so a restart does not wipe your windows.
+- **Deduplication:** Always deduplicate by `runId|teamId|deviceId|sequence` — the Judge does this too; duplicates you publish as separate windows will be scored `Invalid`.
+- **Window timing:** Use `eventTimeUtc` (not wall clock) for window assignment. A burst or gap in wall time should not shift your window boundaries.
 
 ---
 

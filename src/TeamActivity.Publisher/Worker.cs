@@ -27,6 +27,18 @@ public sealed class Worker(
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
 
+        var intervalMs = publisherOptions.Value.MessageIntervalMilliseconds;
+        if (intervalMs <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Publisher:MessageIntervalMilliseconds must be greater than 0, but was {intervalMs}.");
+        }
+
+        var deviceCount = Math.Max(1, publisherOptions.Value.DeviceCount);
+        var runWindowMs = Math.Max(1, publisherOptions.Value.RunWindowSeconds) * 1000;
+        var messageCount = Math.Max(1, runWindowMs / intervalMs);
+        var interval = TimeSpan.FromMilliseconds(intervalMs);
+
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
 
@@ -39,12 +51,9 @@ public sealed class Worker(
         logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
         await client.ConnectAsync(options, stoppingToken);
 
-        await PublishControl(client, challenge, Topics.PublisherStart, stoppingToken);
+        await PublishControl(client, challenge, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs);
 
         var telemetryTopic = Topics.TelemetryRaw(challenge.RunId, challenge.TeamId);
-        var messageCount = Math.Max(1, publisherOptions.Value.MessageCount);
-        var deviceCount = Math.Max(1, publisherOptions.Value.DeviceCount);
-        var interval = TimeSpan.FromMilliseconds(Math.Max(0, publisherOptions.Value.MessageIntervalMilliseconds));
 
         for (var sequence = 1; sequence <= messageCount; sequence++)
         {
@@ -77,14 +86,24 @@ public sealed class Worker(
         await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
     }
 
-    private static Task PublishControl(IMqttClient client, ChallengeOptions challenge, string eventName, CancellationToken cancellationToken)
+    private static Task PublishControl(
+        IMqttClient client,
+        ChallengeOptions challenge,
+        string eventName,
+        CancellationToken cancellationToken,
+        int? deviceCount = null,
+        int? messageIntervalMs = null)
     {
         var control = new ControlMessage(
             Topics.SchemaVersion,
             challenge.RunId,
             challenge.TeamId,
             eventName,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow)
+        {
+            DeviceCount = deviceCount,
+            MessageIntervalMs = messageIntervalMs
+        };
 
         var topic = Topics.Control(challenge.RunId, challenge.TeamId, eventName);
         var json = JsonSerializer.Serialize(control, JsonContract.Options);

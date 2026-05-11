@@ -9,4 +9,6 @@ public sealed record ScoreSnapshot(
     double LatencyP95Ms,
     double Score,
     DateTimeOffset LastUpdatedUtc,
-    string Status);
+    string Status,
+    int? DeviceCount,
+    int? MessageIntervalMs);
