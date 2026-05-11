@@ -12,9 +12,17 @@ dotnet build TeamActivity.sln --nologo --tl:off -v:minimal
 cleanup
 
 aspire start --apphost "$APPHOST" --non-interactive --nologo --format Json
-sleep 28
+sleep 5
 
 aspire describe --apphost "$APPHOST" --non-interactive --nologo
+
+# Trigger a short run (10 seconds) via the Judge API
+curl -fsS -X POST http://localhost:5076/api/run/start \
+  -H 'Content-Type: application/json' \
+  -d '{"deviceCount":3,"intervalMs":250,"runWindowSeconds":10,"chaosEnabled":false}'
+echo ""
+
+sleep 18
 
 scores="$(curl -fsS http://localhost:5076/api/scores)"
 echo "$scores"

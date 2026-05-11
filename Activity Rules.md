@@ -66,11 +66,12 @@ bash scripts/smoke-test.sh
 The script:
 1. Builds the solution
 2. Starts Aspire
-3. Waits for the template run to produce scored windows
-4. Checks the Judge API for at least one correct aggregate
-5. Installs the Playwright Chromium browser if needed
-6. Runs the Scoreboard Playwright UI tests
-7. Stops Aspire
+3. Triggers a short run via the Judge API
+4. Waits for the run to produce scored windows
+5. Checks the Judge API for at least one correct aggregate
+6. Installs the Playwright Chromium browser if needed
+7. Runs the Scoreboard Playwright UI tests
+8. Stops Aspire
 
 If the stack is already running you can run just the UI tests:
 
@@ -255,26 +256,66 @@ Keep the MQTT topic patterns and JSON field names exactly as defined above. Any 
 
 ---
 
+## Scoreboard Control Panel
+
+The Scoreboard is both a leaderboard and an **interactive run launcher**. Open it in a browser after starting Aspire — runs do **not** start automatically.
+
+### Starting a Run
+
+At the top of the Scoreboard page is the **Start a Run** control panel:
+
+| Control | Default | Description |
+|---|---|---|
+| **Device Count** | `3` | Number of simulated devices (`device-001` … `device-N`). Higher = more parallelism and more messages. |
+| **Message Interval (ms)** | `250` | Milliseconds between successive messages from each device. Lower = higher message rate. |
+| **Run Window (seconds)** | `120` | How long the Publisher emits messages. The 2-minute competitive window = 120. |
+| **Enable Chaos Mode** | unchecked | When checked, chaos disruptions are armed as soon as the run begins. |
+| **▶ Start Run** button | — | Sends the trigger to the Judge. The Publisher immediately begins emitting telemetry. |
+
+The **Run Status** badge updates every 2 seconds: **Idle** → **Pending** (trigger received, waiting for Publisher to acknowledge) → **Running** → **Idle** (run complete).
+
+The Start button and all inputs are **disabled** while a run is in progress. Multiple concurrent runs are not supported.
+
+### Starting a Run via the API (scripts)
+
+The same trigger endpoint is available directly on the Judge service:
+
+```bash
+curl -X POST http://localhost:5076/api/run/start \
+  -H 'Content-Type: application/json' \
+  -d '{"deviceCount":3,"intervalMs":250,"runWindowSeconds":120,"chaosEnabled":false}'
+```
+
+The response is `200 OK` with `{"runId":"<uuid>"}`, or `409 Conflict` if a run is already in progress.
+
+---
+
 ## Default Run Parameters
 
-The AppHost configures the Publisher with these defaults at startup:
+The Publisher reads identity from its `appsettings.json`:
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `runId` | `run-template` | Set via `ChallengeOptions` in appsettings |
-| `teamId` | `team-template` | Set via `ChallengeOptions` in appsettings |
-| `MessageIntervalMilliseconds` | `250` | Delay between messages. Lower = more messages per second |
-| `DeviceCount` | `3` | Simulated devices (`device-001`, `device-002`, `device-003`). Higher = more parallelism |
-| `WindowSeconds` | `5` | Aggregation window size |
-| `GraceSeconds` | `2` | Grace period before Judge finalises a window |
-| `StartupDelaySeconds` | `3` | Publisher waits for Judge and Processor to be ready |
+| `teamId` | `team-template` | Set via `ChallengeOptions` — identifies your team on the Scoreboard |
+| `WindowSeconds` | `5` | Aggregation window size (fixed) |
+| `GraceSeconds` | `2` | Grace period before Judge finalises a window (fixed) |
+| `StartupDelaySeconds` | `3` | Publisher waits for Judge and Processor to be ready before polling for a trigger |
 
-**Message count is derived automatically.** The run window is fixed at 2 minutes (120 seconds). Total messages = `max(1, 120 000 / MessageIntervalMilliseconds)` using integer division. For example:
-- `250 ms` interval → **480 messages** across 3 devices (160 per device)
-- `100 ms` interval → **1 200 messages** across 3 devices (400 per device)
-- `50 ms` interval → **2 400 messages**
+**Run parameters are set per-run via the trigger** (Scoreboard UI or API), not in the Publisher config:
 
-**Each team must set their own `runId` and `teamId`** via environment variables or `appsettings.json` so their results appear separately on the Scoreboard.
+| Parameter | Trigger field | Notes |
+|---|---|---|
+| Device Count | `deviceCount` | Simulated devices (`device-001` … `device-N`) |
+| Message Interval | `intervalMs` | Delay between messages in milliseconds |
+| Run Window | `runWindowSeconds` | Duration the Publisher emits telemetry |
+| Chaos Mode | `chaosEnabled` | Arms chaos disruptions for the run |
+
+**Message count is derived automatically** from `runWindowSeconds` and `intervalMs`. For example with the defaults (120 s window, 250 ms interval):
+- **3 devices × 480 messages** = 1 440 total messages
+- `100 ms` interval → 3 × 1 200 = **3 600 messages**
+- `50 ms` interval → 3 × 2 400 = **7 200 messages**
+
+**Each team must set their own `teamId`** in `Publisher/appsettings.json` (or via environment variable) so their results appear separately on the Scoreboard. The `runId` is generated automatically as a UUID for each triggered run.
 
 ---
 
@@ -283,7 +324,9 @@ The AppHost configures the Publisher with these defaults at startup:
 The event runs in **two phases**:
 
 1. **Normal run** — no disruptions. Teams tune and test their pipeline.
-2. **Chaos run** — the organiser may inject one or more disruptions mid-run. The Scoreboard shows an amber **"Chaos Mode"** banner when the phase starts, and a red live banner when a specific event is in progress.
+2. **Chaos run** — start a run with **Enable Chaos Mode** checked in the Scoreboard control panel (or `"chaosEnabled":true` in the API trigger). The Scoreboard shows an amber **"Chaos Mode"** banner when chaos is armed, and a red pulsing banner when a specific event is in progress.
+
+The organiser can fire specific chaos events during the run via the Judge chaos API (or via scripts). Teams know **what types of events can happen** (see below) but **not exactly when** they will be triggered — that is the challenge.
 
 ### Event Types
 

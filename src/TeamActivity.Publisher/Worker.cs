@@ -11,7 +11,8 @@ public sealed class Worker(
     ILogger<Worker> logger,
     IOptions<MqttOptions> mqttOptions,
     IOptions<ChallengeOptions> challengeOptions,
-    IOptions<PublisherOptions> publisherOptions) : BackgroundService
+    IOptions<PublisherOptions> publisherOptions,
+    JudgePollingClient judgeClient) : BackgroundService
 {
     private static readonly Counter<long> TelemetryPublished = TelemetryMeters.Publisher.CreateCounter<long>("telemetry_published_total");
     private static readonly Counter<long> ControlPublished = TelemetryMeters.Publisher.CreateCounter<long>("control_published_total");
@@ -27,18 +28,6 @@ public sealed class Worker(
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
 
-        var intervalMs = publisherOptions.Value.MessageIntervalMilliseconds;
-        if (intervalMs <= 0)
-        {
-            throw new InvalidOperationException(
-                $"Publisher:MessageIntervalMilliseconds must be greater than 0, but was {intervalMs}.");
-        }
-
-        var deviceCount = Math.Max(1, publisherOptions.Value.DeviceCount);
-        var runWindowMs = Math.Max(1, publisherOptions.Value.RunWindowSeconds) * 1000;
-        var messageCount = Math.Max(1, runWindowMs / intervalMs);
-        var interval = TimeSpan.FromMilliseconds(intervalMs);
-
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
 
@@ -51,9 +40,44 @@ public sealed class Worker(
         logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
         await client.ConnectAsync(options, stoppingToken);
 
-        await PublishControl(client, challenge, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs);
+        logger.LogInformation("Publisher connected and idle — waiting for a run trigger via the scoreboard or API.");
 
-        var telemetryTopic = Topics.TelemetryRaw(challenge.RunId, challenge.TeamId);
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            var config = await judgeClient.GetPendingRun(stoppingToken);
+            if (config is null)
+            {
+                await Task.Delay(500, stoppingToken);
+                continue;
+            }
+
+            logger.LogInformation(
+                "Received run trigger: RunId={RunId}, DeviceCount={DeviceCount}, IntervalMs={IntervalMs}, RunWindowSeconds={RunWindowSeconds}",
+                config.RunId, config.DeviceCount, config.IntervalMs, config.RunWindowSeconds);
+
+            await judgeClient.AcknowledgeRun(config.RunId, stoppingToken);
+            await ExecuteRun(client, config, challenge, stoppingToken);
+
+            logger.LogInformation("Run {RunId} complete — returning to idle.", config.RunId);
+        }
+    }
+
+    private async Task ExecuteRun(
+        IMqttClient client,
+        RunTriggerConfig config,
+        ChallengeOptions challenge,
+        CancellationToken stoppingToken)
+    {
+        var intervalMs = config.IntervalMs;
+        var deviceCount = Math.Max(1, config.DeviceCount);
+        var runWindowMs = Math.Max(1, config.RunWindowSeconds) * 1000;
+        var messageCount = Math.Max(1, runWindowMs / intervalMs);
+        var interval = TimeSpan.FromMilliseconds(intervalMs);
+        var runId = config.RunId;
+
+        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs);
+
+        var telemetryTopic = Topics.TelemetryRaw(runId, challenge.TeamId);
 
         for (var sequence = 1; sequence <= messageCount; sequence++)
         {
@@ -61,7 +85,7 @@ public sealed class Worker(
             var now = DateTimeOffset.UtcNow;
             var telemetry = new TelemetryMessage(
                 Topics.SchemaVersion,
-                challenge.RunId,
+                runId,
                 challenge.TeamId,
                 $"device-{deviceNumber:000}",
                 sequence,
@@ -72,7 +96,7 @@ public sealed class Worker(
             var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
             await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
             TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
-            logger.LogInformation("Published telemetry message {Sequence}/{Count} to {Topic}: {Payload}", sequence, messageCount, telemetryTopic, telemetryJson);
+            logger.LogInformation("Published telemetry message {Sequence}/{Count} to {Topic}", sequence, messageCount, telemetryTopic);
 
             if (sequence < messageCount && interval > TimeSpan.Zero)
             {
@@ -80,15 +104,13 @@ public sealed class Worker(
             }
         }
 
-        await PublishControl(client, challenge, Topics.PublisherComplete, stoppingToken);
-
-        logger.LogInformation("Publisher finished the starter message flow and will stay alive for inspection.");
-        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken);
     }
 
     private static Task PublishControl(
         IMqttClient client,
-        ChallengeOptions challenge,
+        string runId,
+        string teamId,
         string eventName,
         CancellationToken cancellationToken,
         int? deviceCount = null,
@@ -96,8 +118,8 @@ public sealed class Worker(
     {
         var control = new ControlMessage(
             Topics.SchemaVersion,
-            challenge.RunId,
-            challenge.TeamId,
+            runId,
+            teamId,
             eventName,
             DateTimeOffset.UtcNow)
         {
@@ -105,7 +127,7 @@ public sealed class Worker(
             MessageIntervalMs = messageIntervalMs
         };
 
-        var topic = Topics.Control(challenge.RunId, challenge.TeamId, eventName);
+        var topic = Topics.Control(runId, teamId, eventName);
         var json = JsonSerializer.Serialize(control, JsonContract.Options);
         var publishTask = PublishJson(client, topic, json, cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
         ControlPublished.Add(1, new KeyValuePair<string, object?>("event", eventName));

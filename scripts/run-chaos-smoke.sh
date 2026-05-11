@@ -33,8 +33,11 @@ cleanup
 aspire start --apphost "$APPHOST" --non-interactive --nologo --format Json
 aspire wait processor --apphost "$APPHOST" --status healthy --timeout 120 --non-interactive --nologo
 
-echo "Arming chaos mode..."
-chaos_post "/api/chaos/enable" '{"runId":"run-template"}'
+echo "Triggering chaos run..."
+curl -fsS -X POST "${JUDGE_URL}/api/run/start" \
+  -H "Content-Type: application/json" \
+  -d '{"deviceCount":3,"intervalMs":250,"runWindowSeconds":10,"chaosEnabled":true}'
+echo ""
 
 sleep 5
 echo "Injecting chaos event: processor-restart..."
@@ -46,7 +49,7 @@ aspire wait processor --apphost "$APPHOST" --status healthy --timeout 120 --non-
 echo "Chaos event complete — clearing signal..."
 chaos_post "/api/chaos/event/end"
 
-sleep 28
+sleep 18
 
 aspire describe --apphost "$APPHOST" --non-interactive --nologo
 scores="$(curl -fsS ${JUDGE_URL}/api/scores)"

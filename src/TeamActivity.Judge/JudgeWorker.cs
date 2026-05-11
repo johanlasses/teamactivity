@@ -13,7 +13,8 @@ public sealed class JudgeWorker(
     IOptions<MqttOptions> mqttOptions,
     IOptions<ChallengeOptions> challengeOptions,
     ScoringStore scoring,
-    ObservedRunStore store) : BackgroundService
+    ObservedRunStore store,
+    RunTriggerStore runTriggers) : BackgroundService
 {
     private static readonly Counter<long> RawReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_raw_received_total");
     private static readonly Counter<long> ResultsReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_results_received_total");
@@ -138,6 +139,10 @@ public sealed class JudgeWorker(
             if (control is not null && error is null)
             {
                 scoring.ObserveControl(control);
+                if (control.Event == Topics.PublisherComplete)
+                {
+                    runTriggers.Complete(control.RunId);
+                }
                 ControlReceived.Add(1, new KeyValuePair<string, object?>("event", control.Event));
             }
 

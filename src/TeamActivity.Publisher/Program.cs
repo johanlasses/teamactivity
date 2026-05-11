@@ -6,6 +6,10 @@ builder.AddServiceDefaults();
 builder.Services.Configure<MqttOptions>(builder.Configuration.GetSection("Mqtt"));
 builder.Services.Configure<ChallengeOptions>(builder.Configuration.GetSection("Challenge"));
 builder.Services.Configure<PublisherOptions>(builder.Configuration.GetSection("Publisher"));
+builder.Services.AddHttpClient<JudgePollingClient>(client =>
+{
+    client.BaseAddress = new Uri("http://judge");
+});
 builder.Services.AddHostedService<Worker>();
 
 var host = builder.Build();

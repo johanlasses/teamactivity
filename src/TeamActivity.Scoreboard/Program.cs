@@ -29,6 +29,15 @@ app.MapGet("/api/chaos", async (JudgeClient judge, CancellationToken cancellatio
     var chaos = await judge.GetChaos(cancellationToken);
     return Results.Json(chaos);
 });
+app.MapGet("/api/run/status", async (JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    var status = await judge.GetRunStatus(cancellationToken);
+    return Results.Json(status);
+});
+app.MapPost("/api/run/start", async (RunStartRequest req, JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    return await judge.StartRun(req, cancellationToken);
+});
 
 app.Run();
 
@@ -49,6 +58,27 @@ internal sealed class JudgeClient(HttpClient httpClient)
     public async Task<ChaosState?> GetChaos(CancellationToken cancellationToken)
     {
         return await Measure(() => httpClient.GetFromJsonAsync<ChaosState>("/api/chaos", cancellationToken), cancellationToken);
+    }
+
+    public async Task<RunStatusSnapshot?> GetRunStatus(CancellationToken cancellationToken)
+    {
+        return await Measure(() => httpClient.GetFromJsonAsync<RunStatusSnapshot>("/api/run/status", cancellationToken), cancellationToken);
+    }
+
+    public async Task<IResult> StartRun(RunStartRequest req, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await httpClient.PostAsJsonAsync("/api/run/start", req, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            return response.IsSuccessStatusCode
+                ? Results.Content(body, "application/json", statusCode: (int)response.StatusCode)
+                : Results.Problem(body, statusCode: (int)response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem($"Failed to reach Judge: {ex.Message}", statusCode: 502);
+        }
     }
 
     private static async Task<T?> Measure<T>(Func<Task<T?>> action, CancellationToken cancellationToken)
@@ -101,6 +131,10 @@ internal sealed record ActiveChaosEvent(
     string Description,
     DateTimeOffset StartedAtUtc);
 
+internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
+internal sealed record RunTriggerConfig(string RunId, int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
+internal sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config);
+
 internal static class ScoreboardPage
 {
     public const string IndexHtml = """
@@ -121,11 +155,57 @@ internal static class ScoreboardPage
     #chaos-banner.armed { display: block; background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
     #chaos-banner.active { display: block; background: #fee2e2; color: #991b1b; border: 2px solid #f87171; animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .7; } }
+    #control-panel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: .75rem; padding: 1.5rem; margin-bottom: 2rem; }
+    #control-panel h2 { margin-top: 0; }
+    .control-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-bottom: 1rem; }
+    .control-field label { display: block; font-size: .85rem; color: #6b7280; margin-bottom: .25rem; }
+    .control-field input[type=number] { width: 90px; padding: .4rem .6rem; border: 1px solid #d1d5db; border-radius: .375rem; font-size: 1rem; }
+    .control-field input[type=number]:disabled, #start-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .chaos-field { display: flex; align-items: center; gap: .5rem; padding-bottom: .35rem; }
+    #start-btn { padding: .5rem 1.25rem; background: #2563eb; color: white; border: none; border-radius: .375rem; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    #start-btn:hover:not(:disabled) { background: #1d4ed8; }
+    #run-status-badge { display: inline-block; padding: .25rem .75rem; border-radius: 9999px; font-size: .85rem; font-weight: 600; }
+    #run-status-badge.idle { background: #d1fae5; color: #065f46; }
+    #run-status-badge.pending { background: #fef3c7; color: #92400e; }
+    #run-status-badge.running { background: #dbeafe; color: #1e40af; }
+    #start-feedback { margin-top: .75rem; font-size: .9rem; }
+    #start-feedback.error { color: #b91c1c; }
+    #start-feedback.success { color: #065f46; }
   </style>
 </head>
 <body>
   <h1>MQTT AI Battle</h1>
   <div id="chaos-banner"></div>
+
+  <div id="control-panel">
+    <h2>Start a Run</h2>
+    <div class="control-row">
+      <div class="control-field">
+        <label for="device-count">Device Count</label>
+        <input type="number" id="device-count" value="3" min="1" max="100">
+      </div>
+      <div class="control-field">
+        <label for="message-interval">Message Interval (ms)</label>
+        <input type="number" id="message-interval" value="250" min="1">
+      </div>
+      <div class="control-field">
+        <label for="run-window">Run Window (seconds)</label>
+        <input type="number" id="run-window" value="120" min="1">
+      </div>
+      <div class="control-field chaos-field">
+        <input type="checkbox" id="chaos-mode">
+        <label for="chaos-mode" style="margin:0">Enable Chaos Mode</label>
+      </div>
+      <div class="control-field">
+        <button id="start-btn" onclick="startRun()">▶ Start Run</button>
+      </div>
+      <div class="control-field" style="padding-bottom:.35rem">
+        Status: <span id="run-status-badge" class="idle">Idle</span>
+      </div>
+    </div>
+    <div id="start-feedback"></div>
+  </div>
+
   <p class="muted">Live scoreboard — aggregate results scored in real time by the Judge.</p>
   <h2>Leaderboard</h2>
   <table>
@@ -169,15 +249,91 @@ internal static class ScoreboardPage
       return el.textContent;
     }
 
+    function setControlsEnabled(enabled) {
+      ['device-count', 'message-interval', 'run-window', 'chaos-mode', 'start-btn'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !enabled;
+      });
+    }
+
+    function updateRunStatusBadge(status) {
+      const badge = document.getElementById('run-status-badge');
+      const normalized = (status || 'idle').toLowerCase();
+      badge.className = 'run-status-badge ' + normalized;
+      badge.textContent = normalized.charAt(0).toUpperCase() + normalized.slice(1);
+      setControlsEnabled(normalized === 'idle');
+    }
+
+    async function startRun() {
+      const deviceCount = parseInt(document.getElementById('device-count').value, 10);
+      const intervalMs = parseInt(document.getElementById('message-interval').value, 10);
+      const runWindowSeconds = parseInt(document.getElementById('run-window').value, 10);
+      const chaosEnabled = document.getElementById('chaos-mode').checked;
+      const feedback = document.getElementById('start-feedback');
+
+      if (!deviceCount || deviceCount < 1) {
+        feedback.className = 'error';
+        feedback.textContent = 'Device Count must be at least 1.';
+        return;
+      }
+      if (!intervalMs || intervalMs < 1) {
+        feedback.className = 'error';
+        feedback.textContent = 'Message Interval must be at least 1 ms.';
+        return;
+      }
+      if (!runWindowSeconds || runWindowSeconds < 1) {
+        feedback.className = 'error';
+        feedback.textContent = 'Run Window must be at least 1 second.';
+        return;
+      }
+
+      setControlsEnabled(false);
+      feedback.className = '';
+      feedback.textContent = 'Starting run…';
+
+      try {
+        const res = await fetch('/api/run/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceCount, intervalMs, runWindowSeconds, chaosEnabled })
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          feedback.className = 'success';
+          const msg = document.createTextNode('Run started: ');
+          feedback.textContent = '';
+          feedback.appendChild(msg);
+          const code = document.createElement('code');
+          code.textContent = data.runId;
+          feedback.appendChild(code);
+        } else {
+          const text = await res.text();
+          feedback.className = 'error';
+          feedback.textContent = 'Failed to start run: ' + res.status + ' — ' + text;
+          setControlsEnabled(true);
+        }
+      } catch (err) {
+        feedback.className = 'error';
+        feedback.textContent = 'Network error: ' + err.message;
+        setControlsEnabled(true);
+      }
+    }
+
     async function refresh() {
-      const [runsResult, scoresResult, chaosResult] = await Promise.allSettled([
+      const [runsResult, scoresResult, chaosResult, statusResult] = await Promise.allSettled([
         fetch('/api/runs').then(r => r.json()),
         fetch('/api/scores').then(r => r.json()),
-        fetch('/api/chaos').then(r => r.json())
+        fetch('/api/chaos').then(r => r.json()),
+        fetch('/api/run/status').then(r => r.json())
       ]);
 
       if (chaosResult.status === 'fulfilled') {
         updateChaosBanner(chaosResult.value);
+      }
+
+      if (statusResult.status === 'fulfilled' && statusResult.value) {
+        updateRunStatusBadge(statusResult.value.status);
       }
 
       if (scoresResult.status === 'fulfilled') {
