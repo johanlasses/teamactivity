@@ -11,6 +11,11 @@ public static class Topics
     public static string TelemetryRaw(string runId, string teamId)
         => $"telemetry/v1/{runId}/{teamId}/raw";
 
+    // MQTT single-level wildcard (+) for run ID — use when the Processor
+    // should receive telemetry for any triggered run.
+    public static string TelemetryRawWildcard(string teamId)
+        => $"telemetry/v1/+/{teamId}/raw";
+
     public static string Result(string runId, string teamId, string deviceId, DateTimeOffset windowStartUtc)
         => $"results/v1/{runId}/{teamId}/device/{deviceId}/window/{windowStartUtc.ToUnixTimeMilliseconds()}";
 

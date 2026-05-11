@@ -44,6 +44,18 @@ public sealed class RunTriggerStore
         }
     }
 
+    public bool TryCancel()
+    {
+        lock (gate)
+        {
+            if (state == RunState.Idle) return false;
+            active = null;
+            pending = null;
+            state = RunState.Idle;
+            return true;
+        }
+    }
+
     public void Complete(string runId)
     {
         lock (gate)

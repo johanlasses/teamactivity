@@ -62,6 +62,13 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
     return Results.Ok(config);
 });
 
+app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos) =>
+{
+    var cancelled = triggers.TryCancel();
+    chaos.Disable();
+    return cancelled ? Results.Ok() : Results.Conflict("No run in progress.");
+});
+
 app.MapPost("/api/chaos/enable", (ChaosEnableRequest req, ChaosStore chaos, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();

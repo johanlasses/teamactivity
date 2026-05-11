@@ -81,6 +81,13 @@ public sealed class Worker(
 
         for (var sequence = 1; sequence <= messageCount; sequence++)
         {
+            // Check every 25 messages whether the run was stopped externally.
+            if (sequence % 25 == 0 && !await judgeClient.IsRunActive(runId, stoppingToken))
+            {
+                logger.LogWarning("Run {RunId} was stopped externally — aborting after {Sequence} messages.", runId, sequence);
+                break;
+            }
+
             var deviceNumber = (sequence - 1) % deviceCount + 1;
             var now = DateTimeOffset.UtcNow;
             var telemetry = new TelemetryMessage(

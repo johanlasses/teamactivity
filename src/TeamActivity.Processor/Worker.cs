@@ -20,12 +20,14 @@ public sealed class Worker(
     private readonly Dictionary<WindowKey, AggregateWindow> windows = [];
     private readonly HashSet<string> seenTelemetry = [];
     private readonly HashSet<WindowKey> publishedWindows = [];
+    private string? currentRunId;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
-        var topic = Topics.TelemetryRaw(challenge.RunId, challenge.TeamId);
+        // Subscribe using a wildcard for runId so we receive telemetry regardless of which UUID was assigned by the trigger.
+        var wildcardTopic = Topics.TelemetryRawWildcard(challenge.TeamId);
 
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
@@ -47,12 +49,12 @@ public sealed class Worker(
 
         var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
             .WithTopicFilter(filter => filter
-                .WithTopic(topic)
+                .WithTopic(wildcardTopic)
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
             .Build();
 
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
-        logger.LogInformation("Processor subscribed to {Topic}", topic);
+        logger.LogInformation("Processor subscribed to {Topic}", wildcardTopic);
 
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(stoppingToken))
@@ -82,9 +84,9 @@ public sealed class Worker(
             return;
         }
 
-        if (telemetry.RunId != challenge.RunId || telemetry.TeamId != challenge.TeamId)
+        if (telemetry.TeamId != challenge.TeamId)
         {
-            logger.LogWarning("Processor ignored telemetry for run/team {RunId}/{TeamId}", telemetry.RunId, telemetry.TeamId);
+            logger.LogWarning("Processor ignored telemetry for team {TeamId}", telemetry.TeamId);
             return;
         }
 
@@ -93,6 +95,17 @@ public sealed class Worker(
 
         lock (gate)
         {
+            // New run detected — reset all state so previous run's data doesn't bleed in.
+            if (currentRunId is not null && currentRunId != telemetry.RunId)
+            {
+                logger.LogInformation("New runId detected ({NewRunId}), clearing window state from previous run.", telemetry.RunId);
+                windows.Clear();
+                seenTelemetry.Clear();
+                publishedWindows.Clear();
+            }
+
+            currentRunId = telemetry.RunId;
+
             if (!seenTelemetry.Add(dedupeKey))
             {
                 logger.LogInformation("Processor ignored duplicate telemetry {DedupeKey}", dedupeKey);

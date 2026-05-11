@@ -18,6 +18,21 @@ public sealed class JudgePollingClient(HttpClient httpClient)
         }
     }
 
+    public async Task<bool> IsRunActive(string runId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await httpClient.GetAsync("/api/run/status", cancellationToken);
+            if (!response.IsSuccessStatusCode) return false;
+            var status = await response.Content.ReadFromJsonAsync<RunStatusSnapshot>(cancellationToken);
+            return status?.Status == "Running" && status.Config?.RunId == runId;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public async Task AcknowledgeRun(string runId, CancellationToken cancellationToken)
     {
         try
@@ -37,3 +52,5 @@ public sealed record RunTriggerConfig(
     int IntervalMs,
     int RunWindowSeconds,
     bool ChaosEnabled);
+
+public sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config);

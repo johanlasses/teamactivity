@@ -38,6 +38,10 @@ app.MapPost("/api/run/start", async (RunStartRequest req, JudgeClient judge, Can
 {
     return await judge.StartRun(req, cancellationToken);
 });
+app.MapPost("/api/run/stop", async (JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    return await judge.StopRun(cancellationToken);
+});
 
 app.Run();
 
@@ -74,6 +78,21 @@ internal sealed class JudgeClient(HttpClient httpClient)
             return response.IsSuccessStatusCode
                 ? Results.Content(body, "application/json", statusCode: (int)response.StatusCode)
                 : Results.Problem(body, statusCode: (int)response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem($"Failed to reach Judge: {ex.Message}", statusCode: 502);
+        }
+    }
+
+    public async Task<IResult> StopRun(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await httpClient.PostAsync("/api/run/stop", null, cancellationToken);
+            return response.IsSuccessStatusCode
+                ? Results.Ok()
+                : Results.Problem(await response.Content.ReadAsStringAsync(cancellationToken), statusCode: (int)response.StatusCode);
         }
         catch (Exception ex)
         {
@@ -160,10 +179,12 @@ internal static class ScoreboardPage
     .control-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-bottom: 1rem; }
     .control-field label { display: block; font-size: .85rem; color: #6b7280; margin-bottom: .25rem; }
     .control-field input[type=number] { width: 90px; padding: .4rem .6rem; border: 1px solid #d1d5db; border-radius: .375rem; font-size: 1rem; }
-    .control-field input[type=number]:disabled, #start-btn:disabled { opacity: .5; cursor: not-allowed; }
+    .control-field input[type=number]:disabled, #start-btn:disabled, #stop-btn:disabled { opacity: .5; cursor: not-allowed; }
     .chaos-field { display: flex; align-items: center; gap: .5rem; padding-bottom: .35rem; }
     #start-btn { padding: .5rem 1.25rem; background: #2563eb; color: white; border: none; border-radius: .375rem; font-size: 1rem; font-weight: 600; cursor: pointer; }
     #start-btn:hover:not(:disabled) { background: #1d4ed8; }
+    #stop-btn { padding: .5rem 1.25rem; background: #dc2626; color: white; border: none; border-radius: .375rem; font-size: 1rem; font-weight: 600; cursor: pointer; display: none; }
+    #stop-btn:hover:not(:disabled) { background: #b91c1c; }
     #run-status-badge { display: inline-block; padding: .25rem .75rem; border-radius: 9999px; font-size: .85rem; font-weight: 600; }
     #run-status-badge.idle { background: #d1fae5; color: #065f46; }
     #run-status-badge.pending { background: #fef3c7; color: #92400e; }
@@ -198,6 +219,7 @@ internal static class ScoreboardPage
       </div>
       <div class="control-field">
         <button id="start-btn" onclick="startRun()">▶ Start Run</button>
+        <button id="stop-btn" onclick="stopRun()" style="margin-left:.5rem">⏹ Stop Run</button>
       </div>
       <div class="control-field" style="padding-bottom:.35rem">
         Status: <span id="run-status-badge" class="idle">Idle</span>
@@ -254,6 +276,8 @@ internal static class ScoreboardPage
         const el = document.getElementById(id);
         if (el) el.disabled = !enabled;
       });
+      const stopBtn = document.getElementById('stop-btn');
+      if (stopBtn) stopBtn.style.display = enabled ? 'none' : 'inline-block';
     }
 
     function updateRunStatusBadge(status) {
@@ -262,6 +286,29 @@ internal static class ScoreboardPage
       badge.className = 'run-status-badge ' + normalized;
       badge.textContent = normalized.charAt(0).toUpperCase() + normalized.slice(1);
       setControlsEnabled(normalized === 'idle');
+    }
+
+    async function stopRun() {
+      const stopBtn = document.getElementById('stop-btn');
+      const feedback = document.getElementById('start-feedback');
+      if (stopBtn) stopBtn.disabled = true;
+      feedback.className = '';
+      feedback.textContent = 'Stopping run…';
+      try {
+        const res = await fetch('/api/run/stop', { method: 'POST' });
+        if (res.ok) {
+          feedback.className = 'success';
+          feedback.textContent = 'Run stopped.';
+        } else {
+          feedback.className = 'error';
+          feedback.textContent = 'Stop failed: ' + res.status;
+          if (stopBtn) stopBtn.disabled = false;
+        }
+      } catch (err) {
+        feedback.className = 'error';
+        feedback.textContent = 'Network error: ' + err.message;
+        if (stopBtn) stopBtn.disabled = false;
+      }
     }
 
     async function startRun() {
