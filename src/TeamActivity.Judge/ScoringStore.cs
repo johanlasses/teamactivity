@@ -19,6 +19,12 @@ public sealed class ScoringStore
     private readonly Dictionary<(string RunId, string TeamId), ScoreState> scores = [];
     private readonly Dictionary<(string RunId, string TeamId), bool> completedRuns = [];
     private readonly Dictionary<(string RunId, string TeamId), (int? DeviceCount, int? MessageIntervalMs)> runParams = [];
+    private readonly Dictionary<string, string> runNames = [];
+
+    public void RegisterRunName(string runId, string name)
+    {
+        lock (gate) runNames[runId] = name;
+    }
 
     public void ObserveTelemetry(TelemetryMessage telemetry, int windowSeconds)
     {
@@ -109,7 +115,7 @@ public sealed class ScoringStore
                 }
 
                 var runComplete = completedRuns.GetValueOrDefault((key.RunId, key.TeamId));
-                if (!runComplete || now < key.WindowEndUtc.AddSeconds(graceSeconds).Add(FinalizationSlack))
+                if (now < key.WindowEndUtc.AddSeconds(graceSeconds).Add(FinalizationSlack))
                 {
                     continue;
                 }
@@ -201,8 +207,10 @@ public sealed class ScoringStore
         var latencyP95Ms = CalculateP95(state.LatenciesMs);
         var score = state.Correct - 5 * state.Invalid - 3 * state.Missing - 0.05 * latencyP95Ms;
         runParams.TryGetValue((runId, teamId), out var rp);
+        var name = runNames.GetValueOrDefault(runId, runId);
         return new ScoreSnapshot(
             runId,
+            name,
             teamId,
             state.Correct,
             state.Invalid,

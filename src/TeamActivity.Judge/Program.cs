@@ -39,13 +39,14 @@ app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore 
         : Results.Conflict("Run acknowledgement failed — state may have changed.");
 });
 
-app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos) =>
+app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos, ScoringStore scoring) =>
 {
     if (req.DeviceCount <= 0 || req.IntervalMs <= 0 || req.RunWindowSeconds <= 0)
         return Results.BadRequest("DeviceCount, IntervalMs, and RunWindowSeconds must be greater than 0.");
 
     var config = new RunTriggerConfig(
         Guid.NewGuid().ToString(),
+        RunNames.Random(),
         req.DeviceCount,
         req.IntervalMs,
         req.RunWindowSeconds,
@@ -53,6 +54,8 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
 
     if (!triggers.TrySetPending(config))
         return Results.Conflict("A run is already pending or in progress. Wait for it to complete.");
+
+    scoring.RegisterRunName(config.RunId, config.Name);
 
     if (req.ChaosEnabled)
         chaos.Enable(config.RunId);

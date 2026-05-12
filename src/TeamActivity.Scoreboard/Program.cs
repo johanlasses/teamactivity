@@ -43,6 +43,18 @@ app.MapPost("/api/run/stop", async (JudgeClient judge, CancellationToken cancell
     return await judge.StopRun(cancellationToken);
 });
 
+app.MapPost("/api/chaos/event/start", async (HttpRequest req, ChaosEventStartRequest body, JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    var organizerKey = req.Headers.TryGetValue("X-Organizer-Key", out var key) ? key.ToString() : null;
+    return await judge.StartChaosEvent(body.Type, body.Description, organizerKey, cancellationToken);
+});
+
+app.MapPost("/api/chaos/event/end", async (HttpRequest req, JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    var organizerKey = req.Headers.TryGetValue("X-Organizer-Key", out var key) ? key.ToString() : null;
+    return await judge.EndChaosEvent(organizerKey, cancellationToken);
+});
+
 app.Run();
 
 internal sealed class JudgeClient(HttpClient httpClient)
@@ -100,6 +112,46 @@ internal sealed class JudgeClient(HttpClient httpClient)
         }
     }
 
+    public async Task<IResult> StartChaosEvent(string type, string? description, string? organizerKey, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, "/api/chaos/event/start")
+            {
+                Content = JsonContent.Create(new { type, description })
+            };
+            if (!string.IsNullOrEmpty(organizerKey))
+                request.Headers.Add("X-Organizer-Key", organizerKey);
+            var response = await httpClient.SendAsync(request, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            return response.IsSuccessStatusCode
+                ? Results.Content(body, "application/json", statusCode: (int)response.StatusCode)
+                : Results.Problem(body, statusCode: (int)response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem($"Failed to reach Judge: {ex.Message}", statusCode: 502);
+        }
+    }
+
+    public async Task<IResult> EndChaosEvent(string? organizerKey, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, "/api/chaos/event/end");
+            if (!string.IsNullOrEmpty(organizerKey))
+                request.Headers.Add("X-Organizer-Key", organizerKey);
+            var response = await httpClient.SendAsync(request, cancellationToken);
+            return response.IsSuccessStatusCode
+                ? Results.Ok()
+                : Results.Problem(await response.Content.ReadAsStringAsync(cancellationToken), statusCode: (int)response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem($"Failed to reach Judge: {ex.Message}", statusCode: 502);
+        }
+    }
+
     private static async Task<T?> Measure<T>(Func<Task<T?>> action, CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -128,6 +180,7 @@ internal sealed record RunSnapshot(
 
 internal sealed record ScoreSnapshot(
     string RunId,
+    string Name,
     string TeamId,
     int Correct,
     int Invalid,
@@ -151,8 +204,9 @@ internal sealed record ActiveChaosEvent(
     DateTimeOffset StartedAtUtc);
 
 internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
-internal sealed record RunTriggerConfig(string RunId, int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
+internal sealed record RunTriggerConfig(string RunId, string Name, int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
 internal sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config);
+internal sealed record ChaosEventStartRequest(string Type, string? Description);
 
 internal static class ScoreboardPage
 {
@@ -192,6 +246,19 @@ internal static class ScoreboardPage
     #start-feedback { margin-top: .75rem; font-size: .9rem; }
     #start-feedback.error { color: #b91c1c; }
     #start-feedback.success { color: #065f46; }
+    #organizer-panel { background: #fdf4ff; border: 1px solid #e9d5ff; border-radius: .75rem; padding: 1.25rem; margin-bottom: 2rem; display: none; }
+    #organizer-panel h3 { margin: 0 0 .75rem; color: #6b21a8; font-size: 1rem; }
+    .organizer-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .75rem; }
+    .chaos-btn { padding: .4rem .85rem; background: #7c3aed; color: white; border: none; border-radius: .375rem; font-size: .875rem; font-weight: 600; cursor: pointer; }
+    .chaos-btn:hover { background: #6d28d9; }
+    .chaos-btn:disabled { opacity: .5; cursor: not-allowed; }
+    #end-event-btn { padding: .4rem .85rem; background: #374151; color: white; border: none; border-radius: .375rem; font-size: .875rem; font-weight: 600; cursor: pointer; }
+    #end-event-btn:hover { background: #1f2937; }
+    #organizer-key-input { padding: .35rem .6rem; border: 1px solid #d1d5db; border-radius: .375rem; font-size: .875rem; width: 200px; }
+    #organizer-toggle { padding: .3rem .75rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: .375rem; font-size: .85rem; cursor: pointer; float: right; margin-top: -2.5rem; }
+    #chaos-feedback { font-size: .85rem; margin-top: .5rem; }
+    #chaos-feedback.error { color: #b91c1c; }
+    #chaos-feedback.success { color: #065f46; }
   </style>
 </head>
 <body>
@@ -199,7 +266,7 @@ internal static class ScoreboardPage
   <div id="chaos-banner"></div>
 
   <div id="control-panel">
-    <h2>Start a Run</h2>
+    <h2>Start a Run <button id="organizer-toggle" onclick="toggleOrganizerPanel()" title="Organizer controls">🎛 Organizer</button></h2>
     <div class="control-row">
       <div class="control-field">
         <label for="device-count">Device Count</label>
@@ -226,6 +293,23 @@ internal static class ScoreboardPage
       </div>
     </div>
     <div id="start-feedback"></div>
+  </div>
+
+  <div id="organizer-panel">
+    <h3>🎛 Organizer — Chaos Controls</h3>
+    <div class="organizer-row">
+      <label style="font-size:.85rem;color:#6b7280;margin-right:.25rem">Key (if set):</label>
+      <input type="password" id="organizer-key-input" placeholder="X-Organizer-Key (optional)" oninput="saveOrganizerKey(this.value)">
+    </div>
+    <div class="organizer-row">
+      <button class="chaos-btn" onclick="fireChaosEvent('processor-restart','Processor service restarted')">🔄 Processor Restart</button>
+      <button class="chaos-btn" onclick="fireChaosEvent('message-burst','Publisher briefly sending at a much faster rate')">💥 Message Burst</button>
+      <button class="chaos-btn" onclick="fireChaosEvent('message-gap','Publisher paused for several seconds')">⏸ Message Gap</button>
+      <button class="chaos-btn" onclick="fireChaosEvent('device-dropout','One device stopped sending')">📵 Device Dropout</button>
+      <button class="chaos-btn" onclick="fireChaosEvent('high-latency','Artificial delay injected between publisher and broker')">🐢 High Latency</button>
+      <button id="end-event-btn" onclick="endChaosEvent()">✅ End Event</button>
+    </div>
+    <div id="chaos-feedback"></div>
   </div>
 
   <p class="muted">Live scoreboard — aggregate results scored in real time by the Judge.</p>
@@ -348,12 +432,11 @@ internal static class ScoreboardPage
         if (res.ok) {
           const data = await res.json();
           feedback.className = 'success';
-          const msg = document.createTextNode('Run started: ');
           feedback.textContent = '';
-          feedback.appendChild(msg);
-          const code = document.createElement('code');
-          code.textContent = data.runId;
-          feedback.appendChild(code);
+          feedback.appendChild(document.createTextNode('Run started: '));
+          const strong = document.createElement('strong');
+          strong.textContent = data.name || data.runId;
+          feedback.appendChild(strong);
         } else {
           const text = await res.text();
           feedback.className = 'error';
@@ -391,7 +474,7 @@ internal static class ScoreboardPage
         } else {
           scoresBody.innerHTML = scores.map(score => `
             <tr>
-              <td>${esc(score.runId)}</td>
+              <td title="${esc(score.runId)}">${esc(score.name || score.runId)}</td>
               <td>${esc(score.teamId)}</td>
               <td>${score.score.toFixed(2)}</td>
               <td>${score.correct}</td>
@@ -429,7 +512,10 @@ internal static class ScoreboardPage
       const banner = document.getElementById('chaos-banner');
       banner.className = '';
       banner.textContent = '';
-      if (!chaos || !chaos.enabled) return;
+      if (!chaos || !chaos.enabled) {
+        document.getElementById('organizer-panel').style.display = 'none';
+        return;
+      }
       if (chaos.activeEvent) {
         banner.className = 'active';
         banner.textContent = '\uD83D\uDD25 CHAOS: ' + chaos.activeEvent.type.toUpperCase().replace(/-/g, ' ');
@@ -444,6 +530,69 @@ internal static class ScoreboardPage
       } else {
         banner.className = 'armed';
         banner.textContent = '\u26A0\uFE0F Chaos Mode — disruptions may occur at any time';
+      }
+    }
+
+    let organizerPanelVisible = false;
+    function toggleOrganizerPanel() {
+      organizerPanelVisible = !organizerPanelVisible;
+      const panel = document.getElementById('organizer-panel');
+      panel.style.display = organizerPanelVisible ? 'block' : 'none';
+      if (organizerPanelVisible) {
+        const saved = sessionStorage.getItem('organizerKey') || '';
+        document.getElementById('organizer-key-input').value = saved;
+      }
+    }
+
+    function saveOrganizerKey(val) {
+      sessionStorage.setItem('organizerKey', val);
+    }
+
+    async function fireChaosEvent(type, description) {
+      const key = sessionStorage.getItem('organizerKey') || '';
+      const feedback = document.getElementById('chaos-feedback');
+      feedback.className = '';
+      feedback.textContent = 'Firing ' + type + '…';
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (key) headers['X-Organizer-Key'] = key;
+        const res = await fetch('/api/chaos/event/start', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ type, description })
+        });
+        if (res.ok) {
+          feedback.className = 'success';
+          feedback.textContent = '🔥 ' + type + ' started.';
+        } else {
+          feedback.className = 'error';
+          feedback.textContent = 'Failed: ' + res.status + (key ? '' : ' (organizer key required?)');
+        }
+      } catch (err) {
+        feedback.className = 'error';
+        feedback.textContent = 'Network error: ' + err.message;
+      }
+    }
+
+    async function endChaosEvent() {
+      const key = sessionStorage.getItem('organizerKey') || '';
+      const feedback = document.getElementById('chaos-feedback');
+      feedback.className = '';
+      feedback.textContent = 'Ending event…';
+      try {
+        const headers = {};
+        if (key) headers['X-Organizer-Key'] = key;
+        const res = await fetch('/api/chaos/event/end', { method: 'POST', headers });
+        if (res.ok) {
+          feedback.className = 'success';
+          feedback.textContent = '✅ Event ended.';
+        } else {
+          feedback.className = 'error';
+          feedback.textContent = 'Failed: ' + res.status;
+        }
+      } catch (err) {
+        feedback.className = 'error';
+        feedback.textContent = 'Network error: ' + err.message;
       }
     }
 

@@ -2,6 +2,7 @@ namespace TeamActivity.Judge;
 
 public sealed record RunTriggerConfig(
     string RunId,
+    string Name,
     int DeviceCount,
     int IntervalMs,
     int RunWindowSeconds,

@@ -276,4 +276,70 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
             expected,
             new PageWaitForFunctionOptions { Timeout = 10_000 });
     }
+
+    // ── Run names ─────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ScoreboardStartFeedbackShowsRunName()
+    {
+        if (!RunUiTests) return;
+        Assert.NotNull(browser);
+
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
+
+        await page.FillAsync("#run-window", "8");
+        await page.ClickAsync("#start-btn");
+
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('start-feedback')?.textContent?.includes('Run started')",
+            new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        var feedbackText = await page.TextContentAsync("#start-feedback") ?? string.Empty;
+        Assert.Contains("Run started", feedbackText, StringComparison.OrdinalIgnoreCase);
+        // The name is shown in bold — ensure it's not just the UUID (UUIDs contain hyphens only)
+        Assert.Matches(@"Run started.*[A-Za-z ]{3,}", feedbackText);
+    }
+
+    // ── Organizer panel ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ScoreboardOrganizerPanelIsHiddenByDefault()
+    {
+        if (!RunUiTests) return;
+        Assert.NotNull(browser);
+
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
+
+        var panel = await page.QuerySelectorAsync("#organizer-panel");
+        Assert.NotNull(panel);
+        var display = await panel.EvaluateAsync<string>("el => getComputedStyle(el).display");
+        Assert.Equal("none", display);
+    }
+
+    [Fact]
+    public async Task ScoreboardOrganizerPanelTogglesVisible()
+    {
+        if (!RunUiTests) return;
+        Assert.NotNull(browser);
+
+        var page = await browser.NewPageAsync();
+        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
+
+        await page.ClickAsync("#organizer-toggle");
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('organizer-panel')?.style.display !== 'none'",
+            new PageWaitForFunctionOptions { Timeout = 3_000 });
+
+        var panel = await page.QuerySelectorAsync("#organizer-panel");
+        Assert.NotNull(panel);
+        var display = await panel.EvaluateAsync<string>("el => el.style.display");
+        Assert.Equal("block", display);
+
+        // Verify all 5 chaos event buttons are present
+        var btns = await page.QuerySelectorAllAsync(".chaos-btn");
+        Assert.Equal(5, btns.Count);
+        Assert.NotNull(await page.QuerySelectorAsync("#end-event-btn"));
+    }
 }

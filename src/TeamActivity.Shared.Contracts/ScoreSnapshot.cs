@@ -2,6 +2,7 @@ namespace TeamActivity.Shared.Contracts;
 
 public sealed record ScoreSnapshot(
     string RunId,
+    string Name,
     string TeamId,
     int Correct,
     int Invalid,
