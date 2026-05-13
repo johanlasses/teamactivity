@@ -9,6 +9,7 @@ builder.Services.AddSingleton<ObservedRunStore>();
 builder.Services.AddSingleton<ScoringStore>();
 builder.Services.AddSingleton<ChaosStore>();
 builder.Services.AddSingleton<RunTriggerStore>();
+builder.Services.AddSingleton<ChaosScheduleTracker>();
 builder.Services.AddHostedService<JudgeWorker>();
 
 var app = builder.Build();
@@ -32,32 +33,47 @@ app.MapGet("/api/run/pending", (RunTriggerStore triggers) =>
     return config is null ? Results.NoContent() : Results.Ok(config);
 });
 
-app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers) =>
+app.MapGet("/api/chaos/schedule", () => Results.Ok(ChaosSchedule.DefaultSchedule));
+
+app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker) =>
 {
-    return triggers.TryAcknowledge(req.RunId)
-        ? Results.Ok()
-        : Results.Conflict("Run acknowledgement failed — state may have changed.");
+    if (!triggers.TryAcknowledge(req.RunId))
+        return Results.Conflict("Run acknowledgement failed — state may have changed.");
+
+    var status = triggers.GetStatus();
+    var config = status.Config;
+    if (config?.ChaosScheduleEnabled == true && status.StartedAtUtc.HasValue)
+    {
+        var cts = new CancellationTokenSource();
+        scheduleTracker.Register(req.RunId, cts);
+        _ = ChaosSchedule.RunAsync(chaos, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+    }
+
+    return Results.Ok();
 });
 
-app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos, ScoringStore scoring) =>
+app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos, ScoringStore scoring, ObservedRunStore observedRunStore) =>
 {
     if (req.DeviceCount <= 0 || req.IntervalMs <= 0 || req.RunWindowSeconds <= 0)
         return Results.BadRequest("DeviceCount, IntervalMs, and RunWindowSeconds must be greater than 0.");
 
+    var chaosScheduleEnabled = req.ChaosScheduleEnabled;
     var config = new RunTriggerConfig(
         Guid.NewGuid().ToString(),
         RunNames.Random(),
         req.DeviceCount,
         req.IntervalMs,
         req.RunWindowSeconds,
-        req.ChaosEnabled);
+        req.ChaosEnabled || chaosScheduleEnabled,
+        chaosScheduleEnabled);
 
     if (!triggers.TrySetPending(config))
         return Results.Conflict("A run is already pending or in progress. Wait for it to complete.");
 
     scoring.RegisterRunName(config.RunId, config.Name);
+    observedRunStore.RegisterRunName(config.RunId, config.Name);
 
-    if (req.ChaosEnabled)
+    if (config.ChaosEnabled)
         chaos.Enable(config.RunId);
     else
         chaos.Disable();
@@ -65,10 +81,13 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
     return Results.Ok(config);
 });
 
-app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos) =>
+app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker) =>
 {
+    var status = triggers.GetStatus();
+    var runId = status.Config?.RunId;
     var cancelled = triggers.TryCancel();
     chaos.Disable();
+    if (runId is not null) scheduleTracker.Cancel(runId);
     return cancelled ? Results.Ok() : Results.Conflict("No run in progress.");
 });
 
@@ -115,5 +134,5 @@ static bool IsAuthorized(HttpContext ctx, string requiredKey)
 
 internal sealed record ChaosEnableRequest(string RunId);
 internal sealed record ChaosEventStartRequest(string Type, string? Description);
-internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
+internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled, bool ChaosScheduleEnabled);
 internal sealed record AcknowledgeRunRequest(string RunId);

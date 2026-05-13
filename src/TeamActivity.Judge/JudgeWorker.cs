@@ -14,7 +14,8 @@ public sealed class JudgeWorker(
     IOptions<ChallengeOptions> challengeOptions,
     ScoringStore scoring,
     ObservedRunStore store,
-    RunTriggerStore runTriggers) : BackgroundService
+    RunTriggerStore runTriggers,
+    ChaosScheduleTracker scheduleTracker) : BackgroundService
 {
     private static readonly Counter<long> RawReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_raw_received_total");
     private static readonly Counter<long> ResultsReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_results_received_total");
@@ -142,6 +143,7 @@ public sealed class JudgeWorker(
                 if (control.Event == Topics.PublisherComplete)
                 {
                     runTriggers.Complete(control.RunId);
+                    scheduleTracker.Cancel(control.RunId);
                 }
                 ControlReceived.Add(1, new KeyValuePair<string, object?>("event", control.Event));
             }

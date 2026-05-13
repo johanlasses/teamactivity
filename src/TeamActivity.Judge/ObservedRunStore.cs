@@ -6,6 +6,12 @@ public sealed class ObservedRunStore
 
     private readonly object gate = new();
     private readonly Dictionary<string, List<ObservedMessage>> messagesByRun = [];
+    private readonly Dictionary<string, string> runNames = [];
+
+    public void RegisterRunName(string runId, string name)
+    {
+        lock (gate) runNames[runId] = name;
+    }
 
     public void AddMessage(ObservedMessage message)
     {
@@ -33,8 +39,10 @@ public sealed class ObservedRunStore
                 .Select(entry =>
                 {
                     var messages = entry.Value;
+                    var name = runNames.GetValueOrDefault(entry.Key, entry.Key);
                     return new RunSnapshot(
                         entry.Key,
+                        name,
                         messages.Select(message => message.TeamId).Distinct().Order().ToArray(),
                         messages.Count,
                         messages.Count(message => message.IsValid),
@@ -59,6 +67,7 @@ public sealed class ObservedRunStore
 
 public sealed record RunSnapshot(
     string RunId,
+    string Name,
     IReadOnlyList<string> TeamIds,
     int MessageCount,
     int ValidMessageCount,

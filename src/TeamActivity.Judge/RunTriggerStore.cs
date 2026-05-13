@@ -6,7 +6,8 @@ public sealed record RunTriggerConfig(
     int DeviceCount,
     int IntervalMs,
     int RunWindowSeconds,
-    bool ChaosEnabled);
+    bool ChaosEnabled,
+    bool ChaosScheduleEnabled);
 
 public sealed class RunTriggerStore
 {
@@ -16,6 +17,7 @@ public sealed class RunTriggerStore
     private RunState state = RunState.Idle;
     private RunTriggerConfig? pending;
     private RunTriggerConfig? active;
+    private DateTimeOffset? startedAtUtc;
 
     public bool TrySetPending(RunTriggerConfig config)
     {
@@ -40,6 +42,7 @@ public sealed class RunTriggerStore
             if (state != RunState.Pending || pending?.RunId != runId) return false;
             active = pending;
             pending = null;
+            startedAtUtc = DateTimeOffset.UtcNow;
             state = RunState.Running;
             return true;
         }
@@ -52,6 +55,7 @@ public sealed class RunTriggerStore
             if (state == RunState.Idle) return false;
             active = null;
             pending = null;
+            startedAtUtc = null;
             state = RunState.Idle;
             return true;
         }
@@ -64,6 +68,7 @@ public sealed class RunTriggerStore
             if (active?.RunId == runId)
             {
                 active = null;
+                startedAtUtc = null;
                 state = RunState.Idle;
             }
         }
@@ -71,8 +76,8 @@ public sealed class RunTriggerStore
 
     public RunStatusSnapshot GetStatus()
     {
-        lock (gate) return new RunStatusSnapshot(state.ToString(), active ?? pending);
+        lock (gate) return new RunStatusSnapshot(state.ToString(), active ?? pending, startedAtUtc);
     }
 }
 
-public sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config);
+public sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config, DateTimeOffset? StartedAtUtc);

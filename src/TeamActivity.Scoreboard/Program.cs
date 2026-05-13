@@ -55,6 +55,12 @@ app.MapPost("/api/chaos/event/end", async (HttpRequest req, JudgeClient judge, C
     return await judge.EndChaosEvent(organizerKey, cancellationToken);
 });
 
+app.MapGet("/api/chaos/schedule", async (JudgeClient judge, CancellationToken cancellationToken) =>
+{
+    var schedule = await judge.GetChaosSchedule(cancellationToken);
+    return Results.Json(schedule);
+});
+
 app.Run();
 
 internal sealed class JudgeClient(HttpClient httpClient)
@@ -152,6 +158,11 @@ internal sealed class JudgeClient(HttpClient httpClient)
         }
     }
 
+    public async Task<object?> GetChaosSchedule(CancellationToken cancellationToken)
+    {
+        return await Measure(() => httpClient.GetFromJsonAsync<object>("/api/chaos/schedule", cancellationToken), cancellationToken);
+    }
+
     private static async Task<T?> Measure<T>(Func<Task<T?>> action, CancellationToken cancellationToken)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -172,6 +183,7 @@ internal sealed class JudgeClient(HttpClient httpClient)
 
 internal sealed record RunSnapshot(
     string RunId,
+    string Name,
     IReadOnlyList<string> TeamIds,
     int MessageCount,
     int ValidMessageCount,
@@ -203,9 +215,9 @@ internal sealed record ActiveChaosEvent(
     string Description,
     DateTimeOffset StartedAtUtc);
 
-internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
-internal sealed record RunTriggerConfig(string RunId, string Name, int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled);
-internal sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config);
+internal sealed record RunStartRequest(int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled, bool ChaosScheduleEnabled);
+internal sealed record RunTriggerConfig(string RunId, string Name, int DeviceCount, int IntervalMs, int RunWindowSeconds, bool ChaosEnabled, bool ChaosScheduleEnabled);
+internal sealed record RunStatusSnapshot(string Status, RunTriggerConfig? Config, DateTimeOffset? StartedAtUtc);
 internal sealed record ChaosEventStartRequest(string Type, string? Description);
 
 internal static class ScoreboardPage
@@ -216,138 +228,512 @@ internal static class ScoreboardPage
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MQTT AI Battle Scoreboard</title>
+  <title>MQTT AI Battle — Scoreboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
   <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; color: #1f2937; }
-    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-    th, td { border-bottom: 1px solid #e5e7eb; padding: .75rem; text-align: left; }
-    th { background: #f9fafb; }
-    .muted { color: #6b7280; }
-    .bad { color: #b91c1c; font-weight: 600; }
-    #chaos-banner { display: none; padding: .75rem 1.25rem; border-radius: .5rem; margin-bottom: 1.5rem; font-weight: 600; font-size: 1.1rem; }
-    #chaos-banner.armed { display: block; background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
-    #chaos-banner.active { display: block; background: #fee2e2; color: #991b1b; border: 2px solid #f87171; animation: pulse 1.5s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .7; } }
-    #control-panel { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: .75rem; padding: 1.5rem; margin-bottom: 2rem; }
-    #control-panel h2 { margin-top: 0; }
-    .control-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-bottom: 1rem; }
-    .control-field label { display: block; font-size: .85rem; color: #6b7280; margin-bottom: .25rem; }
-    .control-field input[type=number] { width: 90px; padding: .4rem .6rem; border: 1px solid #d1d5db; border-radius: .375rem; font-size: 1rem; }
-    .control-field input[type=number]:disabled, #start-btn:disabled, #stop-btn:disabled { opacity: .5; cursor: not-allowed; }
-    .chaos-field { display: flex; align-items: center; gap: .5rem; padding-bottom: .35rem; }
-    #start-btn { padding: .5rem 1.25rem; background: #2563eb; color: white; border: none; border-radius: .375rem; font-size: 1rem; font-weight: 600; cursor: pointer; }
-    #start-btn:hover:not(:disabled) { background: #1d4ed8; }
-    #stop-btn { padding: .5rem 1.25rem; background: #dc2626; color: white; border: none; border-radius: .375rem; font-size: 1rem; font-weight: 600; cursor: pointer; display: none; }
-    #stop-btn:hover:not(:disabled) { background: #b91c1c; }
-    #run-status-badge { display: inline-block; padding: .25rem .75rem; border-radius: 9999px; font-size: .85rem; font-weight: 600; }
-    #run-status-badge.idle { background: #d1fae5; color: #065f46; }
-    #run-status-badge.pending { background: #fef3c7; color: #92400e; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --green:      #76b900;
+      --green-dark: #5a8d00;
+      --ink:        #000000;
+      --canvas:     #ffffff;
+      --surface:    #000000;
+      --soft:       #f7f7f7;
+      --elevated:   #1a1a1a;
+      --hairline:   #cccccc;
+      --hairline-s: #5e5e5e;
+      --body:       #1a1a1a;
+      --muted:      #757575;
+      --on-dark:    #ffffff;
+      --on-dark-m:  rgba(255,255,255,0.7);
+      --red:        #e52020;
+      --red-dark:   #b91c1c;
+      --warn:       #df6500;
+      --warn-bg:    #fef3c7;
+      --radius:     2px;
+    }
+
+    body {
+      font-family: 'Inter', Arial, Helvetica, sans-serif;
+      font-size: 16px;
+      line-height: 1.5;
+      color: var(--body);
+      background: var(--canvas);
+    }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      padding: 0 48px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .corner-sq {
+      width: 12px;
+      height: 12px;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+    .header-title {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--on-dark);
+      letter-spacing: 0;
+    }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    /* ── Chaos banner ────────────────────────────────────────── */
+    #chaos-banner {
+      display: none;
+      padding: 12px 48px;
+      font-weight: 700;
+      font-size: 15px;
+    }
+    #chaos-banner.armed {
+      display: block;
+      background: var(--warn-bg);
+      color: #92400e;
+      border-bottom: 2px solid #fcd34d;
+    }
+    #chaos-banner.active {
+      display: block;
+      background: #fee2e2;
+      color: var(--red-dark);
+      border-bottom: 2px solid var(--red);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.75} }
+
+    /* ── Main layout ─────────────────────────────────────────── */
+    main { max-width: 1280px; margin: 0 auto; padding: 32px 48px 64px; }
+
+    /* ── Card ────────────────────────────────────────────────── */
+    .card {
+      background: var(--canvas);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 24px;
+      position: relative;
+    }
+    .card-corner { position: absolute; top: 0; left: 0; width: 12px; height: 12px; background: var(--green); }
+    .card-title {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 16px;
+      padding-left: 4px;
+    }
+
+    /* ── Buttons ─────────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 22px;
+      font-family: inherit;
+      font-size: 16px;
+      font-weight: 700;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--green); color: var(--ink); }
+    .btn-primary:hover:not(:disabled) { background: var(--green-dark); }
+    .btn-danger  { background: var(--red);   color: var(--on-dark); }
+    .btn-danger:hover:not(:disabled)  { background: var(--red-dark); }
+    .btn-ghost   { background: var(--soft);  color: var(--ink); border: 1px solid var(--hairline); }
+    .btn-ghost:hover:not(:disabled)   { background: var(--hairline); }
+    .btn-sm { padding: 7px 14px; font-size: 14px; }
+
+    /* ── Form controls ───────────────────────────────────────── */
+    .control-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      align-items: flex-end;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .field input[type=number],
+    .field input[type=password] {
+      width: 110px;
+      padding: 10px 12px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      font-family: inherit;
+      font-size: 15px;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    .field input[type=number]:disabled { opacity: .45; }
+    .field input[type=password] { width: 200px; }
+    .check-field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-bottom: 2px;
+    }
+    .check-field input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--green); cursor: pointer; }
+    .check-field label { font-size: 14px; font-weight: 700; color: var(--ink); cursor: pointer; margin: 0; }
+
+    /* ── Status badge ────────────────────────────────────────── */
+    #run-status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    #run-status-badge.idle    { background: #d1fae5; color: #065f46; }
+    #run-status-badge.pending { background: var(--warn-bg); color: #92400e; }
     #run-status-badge.running { background: #dbeafe; color: #1e40af; }
-    #start-feedback { margin-top: .75rem; font-size: .9rem; }
-    #start-feedback.error { color: #b91c1c; }
-    #start-feedback.success { color: #065f46; }
-    #organizer-panel { background: #fdf4ff; border: 1px solid #e9d5ff; border-radius: .75rem; padding: 1.25rem; margin-bottom: 2rem; display: none; }
-    #organizer-panel h3 { margin: 0 0 .75rem; color: #6b21a8; font-size: 1rem; }
-    .organizer-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .75rem; }
-    .chaos-btn { padding: .4rem .85rem; background: #7c3aed; color: white; border: none; border-radius: .375rem; font-size: .875rem; font-weight: 600; cursor: pointer; }
+
+    /* ── Run timer ───────────────────────────────────────────── */
+    #run-timer { display: none; margin-top: 16px; }
+    #run-timer.visible { display: block; }
+    .timer-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .timer-elapsed { color: var(--green); }
+    .progress-track {
+      width: 100%;
+      height: 6px;
+      background: var(--soft);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--green);
+      border-radius: var(--radius);
+      transition: width .8s linear;
+    }
+
+    /* ── Feedback messages ───────────────────────────────────── */
+    #start-feedback, #chaos-feedback {
+      margin-top: 12px;
+      font-size: 14px;
+      min-height: 20px;
+    }
+    #start-feedback.error, #chaos-feedback.error { color: var(--red); }
+    #start-feedback.success, #chaos-feedback.success { color: var(--green-dark); }
+
+    /* ── Organizer panel ─────────────────────────────────────── */
+    #organizer-panel {
+      display: none;
+      background: #fdf4ff;
+      border: 1px solid #e9d5ff;
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .organizer-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #6b21a8;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 12px;
+    }
+    .organizer-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .chaos-btn {
+      padding: 8px 16px;
+      background: #7c3aed;
+      color: white;
+      border: none;
+      border-radius: var(--radius);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background .15s;
+    }
     .chaos-btn:hover { background: #6d28d9; }
     .chaos-btn:disabled { opacity: .5; cursor: not-allowed; }
-    #end-event-btn { padding: .4rem .85rem; background: #374151; color: white; border: none; border-radius: .375rem; font-size: .875rem; font-weight: 600; cursor: pointer; }
-    #end-event-btn:hover { background: #1f2937; }
-    #organizer-key-input { padding: .35rem .6rem; border: 1px solid #d1d5db; border-radius: .375rem; font-size: .875rem; width: 200px; }
-    #organizer-toggle { padding: .3rem .75rem; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: .375rem; font-size: .85rem; cursor: pointer; float: right; margin-top: -2.5rem; }
-    #chaos-feedback { font-size: .85rem; margin-top: .5rem; }
-    #chaos-feedback.error { color: #b91c1c; }
-    #chaos-feedback.success { color: #065f46; }
+    #end-event-btn {
+      padding: 8px 16px;
+      background: var(--elevated);
+      color: var(--on-dark);
+      border: none;
+      border-radius: var(--radius);
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    #end-event-btn:hover { background: #374151; }
+
+    /* ── Schedule preview ────────────────────────────────────── */
+    #schedule-preview {
+      display: none;
+      margin-top: 12px;
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    #schedule-preview.visible { display: block; }
+    #schedule-preview table { margin: 0; }
+
+    /* ── Tables ──────────────────────────────────────────────── */
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 14px;
+    }
+    thead { background: var(--soft); }
+    th {
+      padding: 10px 12px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--hairline);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--hairline);
+      color: var(--body);
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover { background: var(--soft); }
+    .td-muted { color: var(--muted); font-style: italic; }
+    .td-bad { color: var(--red); font-weight: 700; }
+    .td-score { font-weight: 700; color: var(--ink); }
+    .td-rank { font-weight: 700; color: var(--muted); font-size: 13px; }
+    .td-name { font-weight: 700; color: var(--ink); }
+    .medal-1 { color: #c9a227; }
+    .medal-2 { color: #8c8c8c; }
+    .medal-3 { color: #a0522d; }
+
+    /* ── Section heading ─────────────────────────────────────── */
+    .section-eyebrow {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--green);
+      margin-bottom: 4px;
+    }
+    .section-heading {
+      font-size: 22px;
+      font-weight: 700;
+      color: var(--ink);
+      margin-bottom: 4px;
+    }
+    .section-sub {
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 20px;
+    }
+
+    /* ── Footer ──────────────────────────────────────────────── */
+    footer {
+      background: var(--surface);
+      padding: 24px 48px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--on-dark-m);
+      margin-top: 48px;
+    }
+
+    /* ── Organizer toggle (header) ───────────────────────────── */
+    #organizer-toggle {
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      padding: 6px 14px;
+      background: transparent;
+      color: var(--on-dark-m);
+      border: 1px solid var(--hairline-s);
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: color .15s, border-color .15s;
+    }
+    #organizer-toggle:hover { color: var(--on-dark); border-color: var(--on-dark); }
   </style>
 </head>
 <body>
-  <h1>MQTT AI Battle</h1>
+
+  <header>
+    <div class="header-brand">
+      <div class="corner-sq"></div>
+      <span class="header-title">MQTT AI Battle</span>
+    </div>
+    <div class="header-right">
+      <span id="run-status-badge" class="idle">Idle</span>
+      <button id="organizer-toggle" onclick="toggleOrganizerPanel()" title="Organizer controls">🎛 Organizer</button>
+    </div>
+  </header>
+
   <div id="chaos-banner"></div>
 
-  <div id="control-panel">
-    <h2>Start a Run <button id="organizer-toggle" onclick="toggleOrganizerPanel()" title="Organizer controls">🎛 Organizer</button></h2>
-    <div class="control-row">
-      <div class="control-field">
-        <label for="device-count">Device Count</label>
-        <input type="number" id="device-count" value="3" min="1" max="100">
-      </div>
-      <div class="control-field">
-        <label for="message-interval">Message Interval (ms)</label>
-        <input type="number" id="message-interval" value="250" min="1">
-      </div>
-      <div class="control-field">
-        <label for="run-window">Run Window (seconds)</label>
-        <input type="number" id="run-window" value="120" min="1">
-      </div>
-      <div class="control-field chaos-field">
-        <input type="checkbox" id="chaos-mode">
-        <label for="chaos-mode" style="margin:0">Enable Chaos Mode</label>
-      </div>
-      <div class="control-field">
-        <button id="start-btn" onclick="startRun()">▶ Start Run</button>
-        <button id="stop-btn" onclick="stopRun()" style="margin-left:.5rem">⏹ Stop Run</button>
-      </div>
-      <div class="control-field" style="padding-bottom:.35rem">
-        Status: <span id="run-status-badge" class="idle">Idle</span>
-      </div>
-    </div>
-    <div id="start-feedback"></div>
-  </div>
+  <main>
 
-  <div id="organizer-panel">
-    <h3>🎛 Organizer — Chaos Controls</h3>
-    <div class="organizer-row">
-      <label style="font-size:.85rem;color:#6b7280;margin-right:.25rem">Key (if set):</label>
-      <input type="password" id="organizer-key-input" placeholder="X-Organizer-Key (optional)" oninput="saveOrganizerKey(this.value)">
-    </div>
-    <div class="organizer-row">
-      <button class="chaos-btn" onclick="fireChaosEvent('processor-restart','Processor service restarted')">🔄 Processor Restart</button>
-      <button class="chaos-btn" onclick="fireChaosEvent('message-burst','Publisher briefly sending at a much faster rate')">💥 Message Burst</button>
-      <button class="chaos-btn" onclick="fireChaosEvent('message-gap','Publisher paused for several seconds')">⏸ Message Gap</button>
-      <button class="chaos-btn" onclick="fireChaosEvent('device-dropout','One device stopped sending')">📵 Device Dropout</button>
-      <button class="chaos-btn" onclick="fireChaosEvent('high-latency','Artificial delay injected between publisher and broker')">🐢 High Latency</button>
-      <button id="end-event-btn" onclick="endChaosEvent()">✅ End Event</button>
-    </div>
-    <div id="chaos-feedback"></div>
-  </div>
+    <!-- ── Control Panel ─────────────────────────────────────── -->
+    <div class="card" id="control-panel">
+      <div class="card-corner"></div>
+      <div class="card-title">Start a Run</div>
+      <div class="control-row">
+        <div class="field">
+          <label for="device-count">Devices</label>
+          <input type="number" id="device-count" value="3" min="1" max="100">
+        </div>
+        <div class="field">
+          <label for="message-interval">Interval (ms)</label>
+          <input type="number" id="message-interval" value="250" min="1">
+        </div>
+        <div class="field">
+          <label for="run-window">Window (s)</label>
+          <input type="number" id="run-window" value="120" min="1">
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <div class="check-field">
+            <input type="checkbox" id="chaos-mode">
+            <label for="chaos-mode">Chaos Mode</label>
+          </div>
+          <div class="check-field" style="margin-top:6px">
+            <input type="checkbox" id="chaos-schedule" onchange="onScheduleToggle()">
+            <label for="chaos-schedule">Chaos Schedule</label>
+          </div>
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <div style="display:flex;gap:8px">
+            <button id="start-btn" class="btn btn-primary" onclick="startRun()">▶ Start Run</button>
+            <button id="stop-btn" class="btn btn-danger" onclick="stopRun()" style="display:none">⏹ Stop</button>
+          </div>
+        </div>
+      </div>
 
-  <p class="muted">Live scoreboard — aggregate results scored in real time by the Judge.</p>
-  <h2>Leaderboard</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Run</th>
-        <th>Team</th>
-        <th>Score</th>
-        <th>Correct</th>
-        <th>Invalid</th>
-        <th>Missing</th>
-        <th>Latency p95 ms</th>
-        <th>Devices</th>
-        <th>Interval ms</th>
-      </tr>
-    </thead>
-    <tbody id="scores">
-      <tr><td colspan="9" class="muted">Waiting for scores...</td></tr>
-    </tbody>
-  </table>
-  <h2>Observed messages</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Run</th>
-        <th>Teams</th>
-        <th>Messages</th>
-        <th>Valid</th>
-        <th>Invalid</th>
-        <th>Last update</th>
-      </tr>
-    </thead>
-    <tbody id="runs">
-      <tr><td colspan="6" class="muted">Waiting for Judge data...</td></tr>
-    </tbody>
-  </table>
+      <div id="run-timer">
+        <div class="timer-label">
+          <span class="timer-elapsed" id="timer-elapsed">0s elapsed</span>
+          <span id="timer-remaining">—</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div id="start-feedback"></div>
+
+      <div id="schedule-preview">
+        <table>
+          <thead><tr><th>Offset</th><th>Action</th><th>Type</th><th>Description</th></tr></thead>
+          <tbody id="schedule-body"><tr><td colspan="4" class="td-muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── Organizer Panel ───────────────────────────────────── -->
+    <div id="organizer-panel">
+      <div class="organizer-title">🎛 Organizer — Manual Chaos Controls</div>
+      <div class="organizer-row">
+        <span style="font-size:13px;color:#6b7280;margin-right:4px">Key:</span>
+        <input type="password" id="organizer-key-input" placeholder="X-Organizer-Key (optional)" oninput="saveOrganizerKey(this.value)" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:2px;font-size:13px;width:220px">
+      </div>
+      <div class="organizer-row">
+        <button class="chaos-btn" onclick="fireChaosEvent('processor-restart','Processor service restarted')">🔄 Processor Restart</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('message-burst','Publisher briefly sending at a much faster rate')">💥 Message Burst</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('message-gap','Publisher paused for several seconds')">⏸ Message Gap</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('device-dropout','One device stopped sending')">📵 Device Dropout</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('high-latency','Artificial delay injected between publisher and broker')">🐢 High Latency</button>
+        <button id="end-event-btn" onclick="endChaosEvent()">✅ End Event</button>
+      </div>
+      <div id="chaos-feedback"></div>
+    </div>
+
+    <!-- ── Leaderboard ───────────────────────────────────────── -->
+    <div class="section-eyebrow">Live Results</div>
+    <div class="section-heading">Leaderboard</div>
+    <p class="section-sub">Aggregate results scored in real time by the Judge.</p>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Team</th>
+            <th>Score</th>
+            <th>Correct</th>
+            <th>Invalid</th>
+            <th>Missing</th>
+            <th>Latency p95 ms</th>
+            <th>Devices</th>
+            <th>Interval ms</th>
+          </tr>
+        </thead>
+        <tbody id="scores">
+          <tr><td colspan="9" class="td-muted" style="padding:20px 12px">Waiting for scores…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── Observed Messages ─────────────────────────────────── -->
+    <div class="section-eyebrow" style="margin-top:40px">Message Traffic</div>
+    <div class="section-heading">Observed Runs</div>
+    <p class="section-sub">All MQTT messages seen by the Judge, grouped by run.</p>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Teams</th>
+            <th>Messages</th>
+            <th>Valid</th>
+            <th>Invalid</th>
+            <th>Last Update</th>
+          </tr>
+        </thead>
+        <tbody id="runs">
+          <tr><td colspan="6" class="td-muted" style="padding:20px 12px">Waiting for Judge data…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </main>
+
+  <footer>
+    MQTT AI Battle &nbsp;·&nbsp; Judge-scored telemetry competition &nbsp;·&nbsp; Refreshes every 2 s
+  </footer>
+
   <script>
     function esc(val) {
       const el = document.createElement('span');
@@ -356,20 +742,52 @@ internal static class ScoreboardPage
     }
 
     function setControlsEnabled(enabled) {
-      ['device-count', 'message-interval', 'run-window', 'chaos-mode', 'start-btn'].forEach(id => {
+      ['device-count', 'message-interval', 'run-window', 'chaos-mode', 'chaos-schedule', 'start-btn'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = !enabled;
       });
       const stopBtn = document.getElementById('stop-btn');
-      if (stopBtn) stopBtn.style.display = enabled ? 'none' : 'inline-block';
+      if (stopBtn) stopBtn.style.display = enabled ? 'none' : 'inline-flex';
     }
 
     function updateRunStatusBadge(status) {
       const badge = document.getElementById('run-status-badge');
       const normalized = (status || 'idle').toLowerCase();
-      badge.className = 'run-status-badge ' + normalized;
+      badge.className = normalized;
+      badge.id = 'run-status-badge';
       badge.textContent = normalized.charAt(0).toUpperCase() + normalized.slice(1);
       setControlsEnabled(normalized === 'idle');
+    }
+
+    // ── Run timer ─────────────────────────────────────────────
+    let timerInterval = null;
+    let runStartedAt = null;
+    let runWindowSecs = null;
+
+    function startTimer(startedAtUtc, windowSecs) {
+      runStartedAt = new Date(startedAtUtc);
+      runWindowSecs = windowSecs;
+      document.getElementById('run-timer').classList.add('visible');
+      if (timerInterval) clearInterval(timerInterval);
+      timerInterval = setInterval(tickTimer, 500);
+      tickTimer();
+    }
+
+    function stopTimer() {
+      if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+      runStartedAt = null; runWindowSecs = null;
+      document.getElementById('run-timer').classList.remove('visible');
+      document.getElementById('progress-fill').style.width = '0%';
+    }
+
+    function tickTimer() {
+      if (!runStartedAt || !runWindowSecs) return;
+      const elapsed = Math.max(0, (Date.now() - runStartedAt.getTime()) / 1000);
+      const remaining = Math.max(0, runWindowSecs - elapsed);
+      const pct = Math.min(100, (elapsed / runWindowSecs) * 100);
+      document.getElementById('timer-elapsed').textContent = Math.floor(elapsed) + 's elapsed';
+      document.getElementById('timer-remaining').textContent = Math.ceil(remaining) + 's remaining';
+      document.getElementById('progress-fill').style.width = pct.toFixed(1) + '%';
     }
 
     async function stopRun() {
@@ -383,6 +801,7 @@ internal static class ScoreboardPage
         if (res.ok) {
           feedback.className = 'success';
           feedback.textContent = 'Run stopped.';
+          stopTimer();
         } else {
           feedback.className = 'error';
           feedback.textContent = 'Stop failed: ' + res.status;
@@ -400,23 +819,12 @@ internal static class ScoreboardPage
       const intervalMs = parseInt(document.getElementById('message-interval').value, 10);
       const runWindowSeconds = parseInt(document.getElementById('run-window').value, 10);
       const chaosEnabled = document.getElementById('chaos-mode').checked;
+      const chaosScheduleEnabled = document.getElementById('chaos-schedule').checked;
       const feedback = document.getElementById('start-feedback');
 
-      if (!deviceCount || deviceCount < 1) {
-        feedback.className = 'error';
-        feedback.textContent = 'Device Count must be at least 1.';
-        return;
-      }
-      if (!intervalMs || intervalMs < 1) {
-        feedback.className = 'error';
-        feedback.textContent = 'Message Interval must be at least 1 ms.';
-        return;
-      }
-      if (!runWindowSeconds || runWindowSeconds < 1) {
-        feedback.className = 'error';
-        feedback.textContent = 'Run Window must be at least 1 second.';
-        return;
-      }
+      if (!deviceCount || deviceCount < 1) { feedback.className='error'; feedback.textContent='Device Count must be at least 1.'; return; }
+      if (!intervalMs || intervalMs < 1)   { feedback.className='error'; feedback.textContent='Message Interval must be at least 1 ms.'; return; }
+      if (!runWindowSeconds || runWindowSeconds < 1) { feedback.className='error'; feedback.textContent='Run Window must be at least 1 second.'; return; }
 
       setControlsEnabled(false);
       feedback.className = '';
@@ -426,9 +834,8 @@ internal static class ScoreboardPage
         const res = await fetch('/api/run/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceCount, intervalMs, runWindowSeconds, chaosEnabled })
+          body: JSON.stringify({ deviceCount, intervalMs, runWindowSeconds, chaosEnabled, chaosScheduleEnabled })
         });
-
         if (res.ok) {
           const data = await res.json();
           feedback.className = 'success';
@@ -458,33 +865,39 @@ internal static class ScoreboardPage
         fetch('/api/run/status').then(r => r.json())
       ]);
 
-      if (chaosResult.status === 'fulfilled') {
-        updateChaosBanner(chaosResult.value);
-      }
+      if (chaosResult.status === 'fulfilled') updateChaosBanner(chaosResult.value);
 
       if (statusResult.status === 'fulfilled' && statusResult.value) {
-        updateRunStatusBadge(statusResult.value.status);
+        const s = statusResult.value;
+        updateRunStatusBadge(s.status);
+        if (s.status === 'Running' && s.startedAtUtc && s.config?.runWindowSeconds) {
+          if (!runStartedAt) startTimer(s.startedAtUtc, s.config.runWindowSeconds);
+        } else if (s.status === 'Idle') {
+          stopTimer();
+        }
       }
 
       if (scoresResult.status === 'fulfilled') {
         const scores = scoresResult.value;
         const scoresBody = document.getElementById('scores');
         if (!scores.length) {
-          scoresBody.innerHTML = '<tr><td colspan="9" class="muted">No scores yet.</td></tr>';
+          scoresBody.innerHTML = '<tr><td colspan="9" class="td-muted" style="padding:20px 12px">No scores yet.</td></tr>';
         } else {
-          scoresBody.innerHTML = scores.map(score => `
-            <tr>
-              <td title="${esc(score.runId)}">${esc(score.name || score.runId)}</td>
+          scoresBody.innerHTML = scores.map((score, i) => {
+            const rank = i + 1;
+            const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : `${rank}. `;
+            return `<tr>
+              <td class="td-name" title="${esc(score.runId)}">${medal}${esc(score.name || score.runId)}</td>
               <td>${esc(score.teamId)}</td>
-              <td>${score.score.toFixed(2)}</td>
+              <td class="td-score">${score.score.toFixed(2)}</td>
               <td>${score.correct}</td>
-              <td class="${score.invalid ? 'bad' : ''}">${score.invalid}</td>
-              <td class="${score.missing ? 'bad' : ''}">${score.missing}</td>
+              <td class="${score.invalid ? 'td-bad' : ''}">${score.invalid}</td>
+              <td class="${score.missing ? 'td-bad' : ''}">${score.missing}</td>
               <td>${score.latencyP95Ms.toFixed(0)}</td>
               <td>${score.deviceCount ?? '—'}</td>
               <td>${score.messageIntervalMs ?? '—'}</td>
-            </tr>
-          `).join('');
+            </tr>`;
+          }).join('');
         }
       }
 
@@ -492,18 +905,16 @@ internal static class ScoreboardPage
         const runs = runsResult.value;
         const body = document.getElementById('runs');
         if (!runs.length) {
-          body.innerHTML = '<tr><td colspan="6" class="muted">No runs observed yet.</td></tr>';
+          body.innerHTML = '<tr><td colspan="6" class="td-muted" style="padding:20px 12px">No runs observed yet.</td></tr>';
         } else {
-          body.innerHTML = runs.map(run => `
-            <tr>
-              <td>${esc(run.runId)}</td>
-              <td>${run.teamIds.map(esc).join(', ')}</td>
-              <td>${run.messageCount}</td>
-              <td>${run.validMessageCount}</td>
-              <td class="${run.invalidMessageCount ? 'bad' : ''}">${run.invalidMessageCount}</td>
-              <td>${new Date(run.lastUpdatedUtc).toLocaleString()}</td>
-            </tr>
-          `).join('');
+          body.innerHTML = runs.map(run => `<tr>
+            <td class="td-name" title="${esc(run.runId)}">${esc(run.name || run.runId)}</td>
+            <td>${run.teamIds.map(esc).join(', ')}</td>
+            <td>${run.messageCount}</td>
+            <td>${run.validMessageCount}</td>
+            <td class="${run.invalidMessageCount ? 'td-bad' : ''}">${run.invalidMessageCount}</td>
+            <td style="color:var(--muted);font-size:13px">${new Date(run.lastUpdatedUtc).toLocaleString()}</td>
+          </tr>`).join('');
         }
       }
     }
@@ -513,7 +924,7 @@ internal static class ScoreboardPage
       banner.className = '';
       banner.textContent = '';
       if (!chaos || !chaos.enabled) {
-        document.getElementById('organizer-panel').style.display = 'none';
+        document.getElementById('organizer-panel').style.display = organizerPanelVisible ? 'block' : 'none';
         return;
       }
       if (chaos.activeEvent) {
@@ -544,9 +955,7 @@ internal static class ScoreboardPage
       }
     }
 
-    function saveOrganizerKey(val) {
-      sessionStorage.setItem('organizerKey', val);
-    }
+    function saveOrganizerKey(val) { sessionStorage.setItem('organizerKey', val); }
 
     async function fireChaosEvent(type, description) {
       const key = sessionStorage.getItem('organizerKey') || '';
@@ -556,11 +965,7 @@ internal static class ScoreboardPage
       try {
         const headers = { 'Content-Type': 'application/json' };
         if (key) headers['X-Organizer-Key'] = key;
-        const res = await fetch('/api/chaos/event/start', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ type, description })
-        });
+        const res = await fetch('/api/chaos/event/start', { method: 'POST', headers, body: JSON.stringify({ type, description }) });
         if (res.ok) {
           feedback.className = 'success';
           feedback.textContent = '🔥 ' + type + ' started.';
@@ -593,6 +998,28 @@ internal static class ScoreboardPage
       } catch (err) {
         feedback.className = 'error';
         feedback.textContent = 'Network error: ' + err.message;
+      }
+    }
+
+    async function onScheduleToggle() {
+      const enabled = document.getElementById('chaos-schedule').checked;
+      const preview = document.getElementById('schedule-preview');
+      if (!enabled) { preview.classList.remove('visible'); return; }
+      // Auto-enable chaos mode when schedule is on
+      document.getElementById('chaos-mode').checked = true;
+      preview.classList.add('visible');
+      const tbody = document.getElementById('schedule-body');
+      try {
+        const res = await fetch('/api/chaos/schedule');
+        const entries = await res.json();
+        tbody.innerHTML = entries.map(e => `<tr>
+          <td>T+${e.offsetSeconds}s</td>
+          <td>${e.action === 'start' ? '▶ Start' : '⏹ End'}</td>
+          <td>${e.eventType ? esc(e.eventType) : '—'}</td>
+          <td style="color:var(--muted)">${e.description ? esc(e.description) : '—'}</td>
+        </tr>`).join('');
+      } catch {
+        tbody.innerHTML = '<tr><td colspan="4" class="td-muted">Failed to load schedule.</td></tr>';
       }
     }
 
