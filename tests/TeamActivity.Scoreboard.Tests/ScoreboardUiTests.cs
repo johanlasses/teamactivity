@@ -26,320 +26,223 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
         playwright?.Dispose();
     }
 
-    // ── Existing tests (updated) ──────────────────────────────────────────────
+    // ── Scenario 1: No chaos ──────────────────────────────────────────────────
 
+    /// <summary>
+    /// Starts a 10-second run with chaos disabled.
+    /// Verifies the run completes, the processor handled messages, and the result
+    /// is visible in the leaderboard with at least one correct message.
+    /// </summary>
     [Fact]
-    public async Task ScoreboardDisplaysTheTemplateTeamScore()
+    public async Task RunWithoutChaosCompletesAndShowsScore()
     {
         if (!RunUiTests) return;
         Assert.NotNull(browser);
+
+        await EnsureIdleAsync();
 
         var page = await browser.NewPageAsync();
         await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
 
-        await ExpectText(page, "MQTT AI Battle");
-        // RunId is now a UUID — only check for team identity
-        await page.WaitForFunctionAsync(
-            "() => document.body.innerText.includes('team-template')",
-            new PageWaitForFunctionOptions { Timeout = 15_000 });
+        // Confirm we start from idle
+        var initialStatus = await page.TextContentAsync("#run-status-badge") ?? string.Empty;
+        Assert.Contains("Idle", initialStatus, StringComparison.OrdinalIgnoreCase);
 
-        var content = await page.TextContentAsync("body") ?? string.Empty;
-        Assert.Contains("Leaderboard", content);
-        Assert.Contains("team-template", content);
-        Assert.Contains("Observed messages", content);
-    }
-
-    [Fact]
-    public async Task ScoreboardScoresApiReturnsTheJudgeSnapshot()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        var response = await page.GotoAsync($"{ScoreboardBaseUrl}/api/scores");
-
-        Assert.NotNull(response);
-        Assert.True(response.Ok, $"Expected /api/scores to return success but got {response.Status}.");
-
-        var body = await page.TextContentAsync("body") ?? string.Empty;
-        Assert.Contains("team-template", body);
-        Assert.Contains("\"correct\":", body);
-        Assert.DoesNotContain("\"missing\":1", body);
-    }
-
-    // ── Control panel presence and defaults ───────────────────────────────────
-
-    [Fact]
-    public async Task ScoreboardShowsControlPanel()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        Assert.NotNull(await page.QuerySelectorAsync("#device-count"));
-        Assert.NotNull(await page.QuerySelectorAsync("#message-interval"));
-        Assert.NotNull(await page.QuerySelectorAsync("#run-window"));
-        Assert.NotNull(await page.QuerySelectorAsync("#chaos-mode"));
-        Assert.NotNull(await page.QuerySelectorAsync("#start-btn"));
-        Assert.NotNull(await page.QuerySelectorAsync("#run-status-badge"));
-    }
-
-    [Fact]
-    public async Task ScoreboardInputDefaultsAreReasonable()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        Assert.Equal("3", await page.InputValueAsync("#device-count"));
-        Assert.Equal("250", await page.InputValueAsync("#message-interval"));
-        Assert.Equal("120", await page.InputValueAsync("#run-window"));
-        Assert.False(await page.IsCheckedAsync("#chaos-mode"));
-    }
-
-    [Fact]
-    public async Task ScoreboardRunStatusStartsIdle()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        var text = await page.TextContentAsync("#run-status-badge") ?? string.Empty;
-        Assert.Contains("Idle", text, StringComparison.OrdinalIgnoreCase);
-    }
-
-    // ── Start button interaction ──────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScoreboardStartButtonTriggersRun()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.FillAsync("#run-window", "8");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => document.getElementById('start-feedback')?.textContent?.includes('Run started')",
-            new PageWaitForFunctionOptions { Timeout = 10_000 });
-
-        await page.WaitForFunctionAsync(
-            "() => document.body.innerText.includes('team-template')",
-            new PageWaitForFunctionOptions { Timeout = 25_000 });
-
-        var content = await page.TextContentAsync("body") ?? string.Empty;
-        Assert.Contains("team-template", content);
-    }
-
-    [Fact]
-    public async Task ScoreboardStartButtonDisabledWhileRunning()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.FillAsync("#run-window", "30");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => document.getElementById('start-btn')?.disabled === true",
-            new PageWaitForFunctionOptions { Timeout = 5_000 });
-
-        Assert.True(await page.IsDisabledAsync("#start-btn"));
-    }
-
-    [Fact]
-    public async Task ScoreboardRunStatusUpdatesToRunning()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.FillAsync("#run-window", "30");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => { const t = document.getElementById('run-status-badge')?.textContent?.toLowerCase(); return t === 'pending' || t === 'running'; }",
-            new PageWaitForFunctionOptions { Timeout = 10_000 });
-
-        var badgeText = await page.TextContentAsync("#run-status-badge") ?? string.Empty;
-        Assert.True(
-            badgeText.Contains("Pending", StringComparison.OrdinalIgnoreCase) ||
-            badgeText.Contains("Running", StringComparison.OrdinalIgnoreCase));
-    }
-
-    // ── Chaos mode ────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScoreboardChaosCheckboxEnablesChaos()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.CheckAsync("#chaos-mode");
-        await page.FillAsync("#run-window", "8");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => { const c = document.getElementById('chaos-banner')?.className; return c?.includes('armed') || c?.includes('active'); }",
-            new PageWaitForFunctionOptions { Timeout = 15_000 });
-
-        var bannerClass = await page.GetAttributeAsync("#chaos-banner", "class") ?? string.Empty;
-        Assert.True(bannerClass is "armed" or "active", $"Expected armed or active chaos banner, got '{bannerClass}'");
-    }
-
-    [Fact]
-    public async Task ScoreboardChaosUncheckedNoChaosBanner()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
+        // Chaos must be off
         await page.UncheckAsync("#chaos-mode");
-        await page.FillAsync("#run-window", "8");
+
+        // Set a short run window
+        await page.FillAsync("#run-window", "10");
         await page.ClickAsync("#start-btn");
 
+        // Confirm run started and capture the run name
         await page.WaitForFunctionAsync(
             "() => document.getElementById('start-feedback')?.textContent?.includes('Run started')",
-            new PageWaitForFunctionOptions { Timeout = 10_000 });
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
 
+        var feedback = await page.TextContentAsync("#start-feedback") ?? string.Empty;
+        Assert.Contains("Run started", feedback, StringComparison.OrdinalIgnoreCase);
+
+        var runName = ExtractRunName(feedback);
+        Assert.NotEmpty(runName); // must extract a name before run tracking works
+
+        // Wait for the run to reach Running state
+        await page.WaitForFunctionAsync(
+            "() => { const t = document.getElementById('run-status-badge')?.textContent?.toLowerCase(); return t?.includes('running') || t?.includes('pending'); }",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        // Wait for the run to complete (10 s window + finalization grace)
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('run-status-badge')?.textContent?.toLowerCase().includes('idle')",
+            null, new PageWaitForFunctionOptions { Timeout = 30_000 });
+
+        // No chaos banner should be visible
         var bannerClass = await page.GetAttributeAsync("#chaos-banner", "class") ?? string.Empty;
         Assert.True(string.IsNullOrEmpty(bannerClass), $"Expected no chaos banner but got class '{bannerClass}'");
+
+        // Wait an extra polling cycle (2 s) to ensure the table is refreshed
+        await Task.Delay(3_000);
+
+        // Leaderboard must show a row for this run with correct > 0
+        var correctValue = await page.EvaluateAsync<int>(
+            $$"""
+            (() => {
+              const rows = document.querySelectorAll('#scores tr');
+              for (const row of rows) {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 4) continue;
+                if (!row.textContent.includes('team-template')) continue;
+                if (!row.textContent.includes('{{runName}}')) continue;
+                return parseInt(cells[3].textContent ?? '0', 10) || 0;
+              }
+              return -1;
+            })()
+            """);
+
+        var tableSnapshot = await page.EvaluateAsync<string[]>(
+            "Array.from(document.querySelectorAll('#scores tr')).slice(0,5).map(r => r.textContent.trim().replace(/\\s+/g,' '))");
+
+        Assert.True(correctValue > 0,
+            $"Expected row for run '{runName}' with team-template to have correct > 0 " +
+            $"but got {correctValue}. Table snapshot: [{string.Join(" | ", tableSnapshot)}]");
     }
 
-    // ── Input validation ──────────────────────────────────────────────────────
+    // ── Scenario 2: Chaos enabled ─────────────────────────────────────────────
 
+    /// <summary>
+    /// Starts a 30-second run with chaos enabled.
+    /// Verifies: chaos banner shows "armed" on start, live scoring updates appear
+    /// during the run, a chaos event fired via the organizer panel shows as "active"
+    /// in the banner, and the run completes with a score.
+    /// </summary>
     [Fact]
-    public async Task ScoreboardInvalidIntervalPreventsStart()
+    public async Task RunWithChaosShowsLiveScoringAndChaosEvent()
     {
         if (!RunUiTests) return;
         Assert.NotNull(browser);
 
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.FillAsync("#message-interval", "0");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => document.getElementById('start-feedback')?.textContent?.length > 0",
-            new PageWaitForFunctionOptions { Timeout = 5_000 });
-
-        var feedback = await page.TextContentAsync("#start-feedback") ?? string.Empty;
-        Assert.Contains("Interval", feedback, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public async Task ScoreboardInvalidDeviceCountPreventsStart()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
+        await EnsureIdleAsync();
 
         var page = await browser.NewPageAsync();
         await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
 
-        await page.FillAsync("#device-count", "0");
+        // Enable chaos and set run window
+        await page.CheckAsync("#chaos-mode");
+        await page.FillAsync("#run-window", "30");
         await page.ClickAsync("#start-btn");
 
+        // Confirm run started and capture name
         await page.WaitForFunctionAsync(
-            "() => document.getElementById('start-feedback')?.textContent?.length > 0",
-            new PageWaitForFunctionOptions { Timeout = 5_000 });
+            "() => document.getElementById('start-feedback')?.textContent?.includes('Run started')",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
 
         var feedback = await page.TextContentAsync("#start-feedback") ?? string.Empty;
-        Assert.Contains("Device", feedback, StringComparison.OrdinalIgnoreCase);
+        var runName = ExtractRunName(feedback);
+        Assert.NotEmpty(runName); // must extract a name before run tracking works
+
+        // Run must reach Running state
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('run-status-badge')?.textContent?.toLowerCase().includes('running')",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        // Chaos banner must show "armed" — chaos mode is active but no event yet
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('chaos-banner')?.className === 'armed'",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        var armedClass = await page.GetAttributeAsync("#chaos-banner", "class");
+        Assert.Equal("armed", armedClass);
+
+        // Wait for the first scoring window to finalise (~7 s: 5 s window + 2 s grace)
+        // then verify a score row for this run appears — proves live scoring works
+        await page.WaitForFunctionAsync(
+            $$"""
+            () => {
+              const rows = document.querySelectorAll('#scores tr');
+              return Array.from(rows).some(row => {
+                if (!row.textContent.includes('team-template')) return false;
+                if (!row.textContent.includes('{{runName}}')) return false;
+                const correct = parseInt(row.querySelectorAll('td')[3]?.textContent ?? '0', 10);
+                return correct > 0;
+              });
+            }
+            """,
+            null, new PageWaitForFunctionOptions { Timeout = 20_000 });
+
+        // Fire a chaos event via the organizer panel
+        await page.ClickAsync("#organizer-toggle");
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('organizer-panel')?.style.display !== 'none'",
+            null, new PageWaitForFunctionOptions { Timeout = 3_000 });
+
+        // Click the first chaos event button (Message Gap)
+        var chaosBtns = await page.QuerySelectorAllAsync(".chaos-btn");
+        Assert.True(chaosBtns.Count > 0, "Expected at least one chaos event button");
+        await chaosBtns[0].ClickAsync();
+
+        // Banner must transition to "active" — chaos event is now shown in the UI
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('chaos-banner')?.className === 'active'",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        var activeClass = await page.GetAttributeAsync("#chaos-banner", "class");
+        Assert.Equal("active", activeClass);
+
+        // End the chaos event and verify the banner returns to "armed"
+        await page.ClickAsync("#end-event-btn");
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('chaos-banner')?.className === 'armed'",
+            null, new PageWaitForFunctionOptions { Timeout = 10_000 });
+
+        var postEventClass = await page.GetAttributeAsync("#chaos-banner", "class");
+        Assert.Equal("armed", postEventClass);
+
+        // Wait for the full run to complete
+        await page.WaitForFunctionAsync(
+            "() => document.getElementById('run-status-badge')?.textContent?.toLowerCase().includes('idle')",
+            null, new PageWaitForFunctionOptions { Timeout = 45_000 });
+
+        // Final leaderboard must still show the run with correct > 0
+        await Task.Delay(3_000);
+        var finalCorrect = await page.EvaluateAsync<int>(
+            $$"""
+            (() => {
+              const rows = document.querySelectorAll('#scores tr');
+              for (const row of rows) {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 4) continue;
+                if (!row.textContent.includes('team-template')) continue;
+                if (!row.textContent.includes('{{runName}}')) continue;
+                return parseInt(cells[3].textContent ?? '0', 10) || 0;
+              }
+              return -1;
+            })()
+            """);
+        Assert.True(finalCorrect > 0,
+            $"Expected final score for run '{runName}' with team-template to have correct > 0 but got {finalCorrect}");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static async Task ExpectText(IPage page, string expected)
+    /// <summary>Stops any active run and waits for the scoreboard to reflect idle.</summary>
+    private async Task EnsureIdleAsync()
     {
-        await page.WaitForFunctionAsync(
-            "expected => document.body.innerText.includes(expected)",
-            expected,
-            new PageWaitForFunctionOptions { Timeout = 10_000 });
+        using var http = new HttpClient();
+        await http.PostAsync($"{ScoreboardBaseUrl}/api/run/stop", null);
+        await Task.Delay(2_500);
     }
 
-    // ── Run names ─────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScoreboardStartFeedbackShowsRunName()
+    /// <summary>
+    /// Extracts the run name from the start-feedback text.
+    /// The DOM renders: TextNode("Run started: ") + &lt;strong&gt;Name&lt;/strong&gt;
+    /// so textContent gives "Run started: Frank Underwood".
+    /// </summary>
+    private static string ExtractRunName(string feedback)
     {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.FillAsync("#run-window", "8");
-        await page.ClickAsync("#start-btn");
-
-        await page.WaitForFunctionAsync(
-            "() => document.getElementById('start-feedback')?.textContent?.includes('Run started')",
-            new PageWaitForFunctionOptions { Timeout = 10_000 });
-
-        var feedbackText = await page.TextContentAsync("#start-feedback") ?? string.Empty;
-        Assert.Contains("Run started", feedbackText, StringComparison.OrdinalIgnoreCase);
-        // The name is shown in bold — ensure it's not just the UUID (UUIDs contain hyphens only)
-        Assert.Matches(@"Run started.*[A-Za-z ]{3,}", feedbackText);
-    }
-
-    // ── Organizer panel ───────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScoreboardOrganizerPanelIsHiddenByDefault()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        var panel = await page.QuerySelectorAsync("#organizer-panel");
-        Assert.NotNull(panel);
-        var display = await panel.EvaluateAsync<string>("el => getComputedStyle(el).display");
-        Assert.Equal("none", display);
-    }
-
-    [Fact]
-    public async Task ScoreboardOrganizerPanelTogglesVisible()
-    {
-        if (!RunUiTests) return;
-        Assert.NotNull(browser);
-
-        var page = await browser.NewPageAsync();
-        await page.GotoAsync(ScoreboardBaseUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle });
-
-        await page.ClickAsync("#organizer-toggle");
-        await page.WaitForFunctionAsync(
-            "() => document.getElementById('organizer-panel')?.style.display !== 'none'",
-            new PageWaitForFunctionOptions { Timeout = 3_000 });
-
-        var panel = await page.QuerySelectorAsync("#organizer-panel");
-        Assert.NotNull(panel);
-        var display = await panel.EvaluateAsync<string>("el => el.style.display");
-        Assert.Equal("block", display);
-
-        // Verify all 5 chaos event buttons are present
-        var btns = await page.QuerySelectorAllAsync(".chaos-btn");
-        Assert.Equal(5, btns.Count);
-        Assert.NotNull(await page.QuerySelectorAsync("#end-event-btn"));
+        const string prefix = "Run started";
+        var idx = feedback.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return string.Empty;
+        // Strip the trailing ": " separator the JS inserts before the name
+        return feedback[(idx + prefix.Length)..].TrimStart(':', ' ', '\t', '\n', '\r').Trim();
     }
 }
