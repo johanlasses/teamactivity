@@ -573,20 +573,6 @@ internal static class ScoreboardPage
       margin-top: 48px;
     }
 
-    /* ── Organizer toggle (header) ───────────────────────────── */
-    #organizer-toggle {
-      font-family: inherit;
-      font-size: 13px;
-      font-weight: 700;
-      padding: 6px 14px;
-      background: transparent;
-      color: var(--on-dark-m);
-      border: 1px solid var(--hairline-s);
-      border-radius: var(--radius);
-      cursor: pointer;
-      transition: color .15s, border-color .15s;
-    }
-    #organizer-toggle:hover { color: var(--on-dark); border-color: var(--on-dark); }
   </style>
 </head>
 <body>
@@ -598,7 +584,6 @@ internal static class ScoreboardPage
     </div>
     <div class="header-right">
       <span id="run-status-badge" class="idle">Idle</span>
-      <button id="organizer-toggle" onclick="toggleOrganizerPanel()" title="Organizer controls">🎛 Organizer</button>
     </div>
   </header>
 
@@ -626,12 +611,12 @@ internal static class ScoreboardPage
         <div class="field">
           <label>&nbsp;</label>
           <div class="check-field">
-            <input type="checkbox" id="chaos-mode">
-            <label for="chaos-mode">Chaos Mode</label>
-          </div>
-          <div class="check-field" style="margin-top:6px">
             <input type="checkbox" id="chaos-schedule" onchange="onScheduleToggle()">
             <label for="chaos-schedule">Chaos Schedule</label>
+          </div>
+          <div class="check-field" style="margin-top:6px">
+            <input type="checkbox" id="chaos-mode" onchange="onManualChaosToggle()">
+            <label for="chaos-mode">Manual Chaos Events</label>
           </div>
         </div>
         <div class="field">
@@ -676,7 +661,7 @@ internal static class ScoreboardPage
         <button class="chaos-btn" onclick="fireChaosEvent('message-gap','Publisher paused for several seconds')">⏸ Message Gap</button>
         <button class="chaos-btn" onclick="fireChaosEvent('device-dropout','One device stopped sending')">📵 Device Dropout</button>
         <button class="chaos-btn" onclick="fireChaosEvent('high-latency','Artificial delay injected between publisher and broker')">🐢 High Latency</button>
-        <button id="end-event-btn" onclick="endChaosEvent()">✅ End Event</button>
+        <button id="end-event-btn" onclick="endChaosEvent()">🧹 Clear Chaos</button>
       </div>
       <div id="chaos-feedback"></div>
     </div>
@@ -924,7 +909,7 @@ internal static class ScoreboardPage
       banner.className = '';
       banner.textContent = '';
       if (!chaos || !chaos.enabled) {
-        document.getElementById('organizer-panel').style.display = organizerPanelVisible ? 'block' : 'none';
+        document.getElementById('organizer-panel').style.display = document.getElementById('chaos-mode').checked ? 'block' : 'none';
         return;
       }
       if (chaos.activeEvent) {
@@ -944,12 +929,11 @@ internal static class ScoreboardPage
       }
     }
 
-    let organizerPanelVisible = false;
-    function toggleOrganizerPanel() {
-      organizerPanelVisible = !organizerPanelVisible;
+    function onManualChaosToggle() {
       const panel = document.getElementById('organizer-panel');
-      panel.style.display = organizerPanelVisible ? 'block' : 'none';
-      if (organizerPanelVisible) {
+      const checked = document.getElementById('chaos-mode').checked;
+      panel.style.display = checked ? 'block' : 'none';
+      if (checked) {
         const saved = sessionStorage.getItem('organizerKey') || '';
         document.getElementById('organizer-key-input').value = saved;
       }
@@ -990,7 +974,7 @@ internal static class ScoreboardPage
         const res = await fetch('/api/chaos/event/end', { method: 'POST', headers });
         if (res.ok) {
           feedback.className = 'success';
-          feedback.textContent = '✅ Event ended.';
+          feedback.textContent = '✅ Chaos ended.';
         } else {
           feedback.className = 'error';
           feedback.textContent = 'Failed: ' + res.status;
@@ -1005,8 +989,6 @@ internal static class ScoreboardPage
       const enabled = document.getElementById('chaos-schedule').checked;
       const preview = document.getElementById('schedule-preview');
       if (!enabled) { preview.classList.remove('visible'); return; }
-      // Auto-enable chaos mode when schedule is on
-      document.getElementById('chaos-mode').checked = true;
       preview.classList.add('visible');
       const tbody = document.getElementById('schedule-body');
       try {
