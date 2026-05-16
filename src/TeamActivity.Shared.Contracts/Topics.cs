@@ -8,6 +8,8 @@ public static class Topics
 
     public const string PublisherComplete = "publisher-complete";
 
+    public const string RunTrigger = "runs/v1/trigger";
+
     public static string TelemetryRaw(string runId, string teamId)
         => $"telemetry/v1/{runId}/{teamId}/raw";
 

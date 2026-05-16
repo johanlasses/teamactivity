@@ -65,8 +65,6 @@ public sealed class Worker(
 
     private void HandleTelemetry(string topic, string payload, ChallengeOptions challenge)
     {
-        logger.LogInformation("Processor received message on {Topic}: {Payload}", topic, payload);
-
         TelemetryMessage? telemetry;
         try
         {
@@ -108,7 +106,6 @@ public sealed class Worker(
 
             if (!seenTelemetry.Add(dedupeKey))
             {
-                logger.LogInformation("Processor ignored duplicate telemetry {DedupeKey}", dedupeKey);
                 return;
             }
 
@@ -172,7 +169,15 @@ public sealed class Worker(
 
             await client.PublishAsync(message, cancellationToken);
             ResultsPublished.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-            logger.LogInformation("Processor published aggregate result to {Topic}: {Payload}", topic, json);
+            logger.LogInformation(
+                "Window reported: Device={DeviceId} [{WindowStart:HH:mm:ss}–{WindowEnd:HH:mm:ss}] Count={Count} Avg={Avg:F2} Min={Min:F2} Max={Max:F2}",
+                key.DeviceId,
+                key.WindowStartUtc,
+                key.WindowEndUtc,
+                aggregate.Count,
+                aggregate.Avg,
+                aggregate.Min,
+                aggregate.Max);
         }
     }
 }

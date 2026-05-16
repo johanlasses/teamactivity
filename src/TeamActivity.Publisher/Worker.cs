@@ -1,5 +1,7 @@
 using System.Diagnostics.Metrics;
+using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using MQTTnet;
 using MQTTnet.Protocol;
@@ -11,8 +13,7 @@ public sealed class Worker(
     ILogger<Worker> logger,
     IOptions<MqttOptions> mqttOptions,
     IOptions<ChallengeOptions> challengeOptions,
-    IOptions<PublisherOptions> publisherOptions,
-    JudgePollingClient judgeClient) : BackgroundService
+    IOptions<PublisherOptions> publisherOptions) : BackgroundService
 {
     private static readonly Counter<long> TelemetryPublished = TelemetryMeters.Publisher.CreateCounter<long>("telemetry_published_total");
     private static readonly Counter<long> ControlPublished = TelemetryMeters.Publisher.CreateCounter<long>("control_published_total");
@@ -31,6 +32,23 @@ public sealed class Worker(
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
 
+        var triggerChannel = Channel.CreateBounded<RunTriggerMessage>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+
+        client.ApplicationMessageReceivedAsync += args =>
+        {
+            if (args.ApplicationMessage.Topic == Topics.RunTrigger)
+            {
+                var payload = Encoding.UTF8.GetString(args.ApplicationMessage.Payload);
+                var trigger = JsonSerializer.Deserialize<RunTriggerMessage>(payload, JsonContract.Options);
+                if (trigger is not null)
+                    triggerChannel.Writer.TryWrite(trigger);
+            }
+            return Task.CompletedTask;
+        };
+
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"publisher-{challenge.TeamId}")
             .WithTcpServer(mqtt.Host, mqtt.Port)
@@ -40,74 +58,84 @@ public sealed class Worker(
         logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
         await client.ConnectAsync(options, stoppingToken);
 
-        logger.LogInformation("Publisher connected and idle — waiting for a run trigger via the scoreboard or API.");
+        var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
+            .WithTopicFilter(filter => filter
+                .WithTopic(Topics.RunTrigger)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
+            .Build();
 
-        while (!stoppingToken.IsCancellationRequested)
+        await client.SubscribeAsync(subscribeOptions, stoppingToken);
+        logger.LogInformation("Publisher connected and idle — waiting for a run trigger via MQTT.");
+
+        await foreach (var trigger in triggerChannel.Reader.ReadAllAsync(stoppingToken))
         {
-            var config = await judgeClient.GetPendingRun(stoppingToken);
-            if (config is null)
-            {
-                await Task.Delay(500, stoppingToken);
-                continue;
-            }
-
             logger.LogInformation(
                 "Received run trigger: RunId={RunId}, DeviceCount={DeviceCount}, IntervalMs={IntervalMs}, RunWindowSeconds={RunWindowSeconds}",
-                config.RunId, config.DeviceCount, config.IntervalMs, config.RunWindowSeconds);
+                trigger.RunId, trigger.DeviceCount, trigger.IntervalMs, trigger.RunWindowSeconds);
 
-            await judgeClient.AcknowledgeRun(config.RunId, stoppingToken);
-            await ExecuteRun(client, config, challenge, stoppingToken);
+            await ExecuteRun(client, trigger, challenge, stoppingToken);
 
-            logger.LogInformation("Run {RunId} complete — returning to idle.", config.RunId);
+            logger.LogInformation("Run {RunId} complete — returning to idle.", trigger.RunId);
         }
     }
 
     private async Task ExecuteRun(
         IMqttClient client,
-        RunTriggerConfig config,
+        RunTriggerMessage trigger,
         ChallengeOptions challenge,
         CancellationToken stoppingToken)
     {
-        var intervalMs = config.IntervalMs;
-        var deviceCount = Math.Max(1, config.DeviceCount);
-        var runWindowMs = Math.Max(1, config.RunWindowSeconds) * 1000;
-        var messageCount = Math.Max(1, runWindowMs / intervalMs);
-        var interval = TimeSpan.FromMilliseconds(intervalMs);
-        var runId = config.RunId;
+        var intervalMs = trigger.IntervalMs;
+        var deviceCount = Math.Max(1, trigger.DeviceCount);
+        var runWindowSeconds = Math.Max(1, trigger.RunWindowSeconds);
+        var messagesPerDevice = RunMath.CalculateMessagesPerDevice(runWindowSeconds, intervalMs);
+        var theoreticalTotalMessages = RunMath.CalculateTheoreticalTelemetryCount(deviceCount, runWindowSeconds, intervalMs);
+        var runId = trigger.RunId;
+        var runStartedAtUtc = DateTimeOffset.UtcNow;
+        var runEndsAtUtc = runStartedAtUtc.AddSeconds(runWindowSeconds);
+        long publishedCount = 0;
+        long sequence = 1;
 
-        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs);
+        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs, runWindowSeconds);
 
         var telemetryTopic = Topics.TelemetryRaw(runId, challenge.TeamId);
 
-        for (var sequence = 1; sequence <= messageCount; sequence++)
+        for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
         {
-            // Check every 25 messages whether the run was stopped externally.
-            if (sequence % 25 == 0 && !await judgeClient.IsRunActive(runId, stoppingToken))
+            var scheduledAtUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
+            var delay = scheduledAtUtc - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
             {
-                logger.LogWarning("Run {RunId} was stopped externally — aborting after {Sequence} messages.", runId, sequence);
+                await Task.Delay(delay, stoppingToken);
+            }
+
+            if (DateTimeOffset.UtcNow >= runEndsAtUtc)
+            {
+                logger.LogWarning(
+                    "Run {RunId} ended before all scheduled emissions could be sent. Published={PublishedCount}, Theoretical={TheoreticalTotalMessages}",
+                    runId,
+                    publishedCount,
+                    theoreticalTotalMessages);
                 break;
             }
 
-            var deviceNumber = (sequence - 1) % deviceCount + 1;
-            var now = DateTimeOffset.UtcNow;
-            var telemetry = new TelemetryMessage(
-                Topics.SchemaVersion,
-                runId,
-                challenge.TeamId,
-                $"device-{deviceNumber:000}",
-                sequence,
-                now,
-                now,
-                40 + deviceNumber + sequence / 10.0);
-
-            var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
-            await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
-            TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
-            logger.LogInformation("Published telemetry message {Sequence}/{Count} to {Topic}", sequence, messageCount, telemetryTopic);
-
-            if (sequence < messageCount && interval > TimeSpan.Zero)
+            for (var deviceNumber = 1; deviceNumber <= deviceCount; deviceNumber++)
             {
-                await Task.Delay(interval, stoppingToken);
+                var publishedAtUtc = DateTimeOffset.UtcNow;
+                var telemetry = new TelemetryMessage(
+                    Topics.SchemaVersion,
+                    runId,
+                    challenge.TeamId,
+                    $"device-{deviceNumber:000}",
+                    sequence++,
+                    scheduledAtUtc,
+                    publishedAtUtc,
+                    40 + deviceNumber + emissionIndex / 10.0);
+
+                var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
+                await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
+                publishedCount++;
+                TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
             }
         }
 
@@ -121,7 +149,8 @@ public sealed class Worker(
         string eventName,
         CancellationToken cancellationToken,
         int? deviceCount = null,
-        int? messageIntervalMs = null)
+        int? messageIntervalMs = null,
+        int? runWindowSeconds = null)
     {
         var control = new ControlMessage(
             Topics.SchemaVersion,
@@ -131,7 +160,8 @@ public sealed class Worker(
             DateTimeOffset.UtcNow)
         {
             DeviceCount = deviceCount,
-            MessageIntervalMs = messageIntervalMs
+            MessageIntervalMs = messageIntervalMs,
+            RunWindowSeconds = runWindowSeconds
         };
 
         var topic = Topics.Control(runId, teamId, eventName);

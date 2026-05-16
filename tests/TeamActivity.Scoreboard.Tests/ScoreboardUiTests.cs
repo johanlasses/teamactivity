@@ -165,7 +165,6 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
             null, new PageWaitForFunctionOptions { Timeout = 20_000 });
 
         // Fire a chaos event via the organizer panel
-        await page.ClickAsync("#organizer-toggle");
         await page.WaitForFunctionAsync(
             "() => document.getElementById('organizer-panel')?.style.display !== 'none'",
             null, new PageWaitForFunctionOptions { Timeout = 3_000 });

@@ -207,20 +207,39 @@ windowEnd   = windowStart + 5000 ms
 
 ## Scoring
 
-The Judge scores each window independently once the grace period expires.
+The Judge combines **four main criteria** — interval challenge, device challenge, publisher attainment, and processor correctness — once windows have cleared the grace period.
 
 ```
-Score = Correct − 5 × Invalid − 3 × Missing − 0.05 × LatencyP95ms
+Score =
+  1000 × IntervalChallenge
+  + 1000 × DeviceChallenge
+  + 1000 × PublishAttainment
+  + 1000 × WindowCorrectness
+  − 1200 × WindowInvalidRate
+  − 800 × WindowMissingRate
+  + 10 × log10(1 + Correct)
+  − 0.05 × LatencyP95ms
 ```
 
 | Term | Definition |
 |---|---|
-| **Correct** | Result arrived on time and all five aggregate fields (`count`, `sum`, `min`, `max`, `avg`) match the Judge's independent calculation within a tolerance of `0.000001` |
-| **Invalid** | Result arrived but was malformed, had a schema mismatch, had topic/payload field mismatches, was a duplicate, or arrived for a window the Judge never saw telemetry for |
-| **Missing** | Window was finalised with no matching result (or only an invalid result) |
+| **IntervalChallenge** | `min(1, 50 / intervalMs)` so `50 ms` gets full points and higher intervals scale down |
+| **DeviceChallenge** | `min(1, deviceCount / 10000)` so `10,000` devices gets full points and smaller runs scale down |
+| **PublishAttainment** | `broker-observed telemetry / theoretical telemetry`, capped at `1.0` |
+| **WindowCorrectness** | `correct windows / fully observed windows` |
+| **WindowInvalidRate** | `invalid windows / fully observed windows` |
+| **WindowMissingRate** | `missing windows / fully observed windows` |
+| **Correct volume bonus** | `10 × log10(1 + Correct)` so each 10× increase in correct windows adds a modest bonus |
 | **LatencyP95ms** | 95th-percentile of `(result received at Judge − windowEnd)` across all correct results (in milliseconds) |
 
-> A high **Invalid** count is heavily penalised (−5 each). Focus on correctness before latency.
+### Window validation rules
+
+- The Judge computes a **theoretical count per device/window** from the configured run start, run duration, device count, and message interval.
+- The Judge also counts how many telemetry messages actually reached the broker for each device/window.
+- A window is **fully observed** only when the broker-observed count matches the theoretical count.
+- Processor results are scored as **Correct**, **Invalid**, or **Missing** only for fully observed windows.
+- Windows where the publisher did not hit the theoretical count are tracked separately as **publisher mismatch windows** and affect total score through publish attainment instead of being double-penalised as processor failures.
+- Interval and device challenge scores are each **capped at 1.0**, so teams cannot gain extra points beyond the `50 ms` and `10,000 device` baselines.
 
 ---
 
@@ -310,7 +329,14 @@ The Publisher reads identity from its `appsettings.json`:
 | Run Window | `runWindowSeconds` | Duration the Publisher emits telemetry |
 | Chaos Mode | `chaosEnabled` | Arms chaos disruptions for the run |
 
-**Message count is derived automatically** from `runWindowSeconds` and `intervalMs`. For example with the defaults (120 s window, 250 ms interval):
+**Message count is derived automatically per device** from `runWindowSeconds` and `intervalMs`. The theoretical total is:
+
+```text
+messagesPerDevice = ceil(runWindowSeconds × 1000 / intervalMs)
+theoreticalTotalMessages = deviceCount × messagesPerDevice
+```
+
+For example with the defaults (120 s window, 250 ms interval):
 - **3 devices × 480 messages** = 1 440 total messages
 - `100 ms` interval → 3 × 1 200 = **3 600 messages**
 - `50 ms` interval → 3 × 2 400 = **7 200 messages**

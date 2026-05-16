@@ -14,16 +14,17 @@ public sealed class ScoringStore
     private readonly Dictionary<WindowKey, ExpectedWindow> expectedWindows = [];
     private readonly Dictionary<WindowKey, ResultCandidate> resultCandidates = [];
     private readonly HashSet<string> seenTelemetry = [];
-    private readonly HashSet<WindowKey> scoredWindows = [];
-    private readonly HashSet<WindowKey> missingWindows = [];
+    private readonly HashSet<WindowKey> finalizedWindows = [];
     private readonly Dictionary<(string RunId, string TeamId), ScoreState> scores = [];
-    private readonly Dictionary<(string RunId, string TeamId), bool> completedRuns = [];
-    private readonly Dictionary<(string RunId, string TeamId), (int? DeviceCount, int? MessageIntervalMs)> runParams = [];
+    private readonly Dictionary<(string RunId, string TeamId), RunParameters> runParams = [];
     private readonly Dictionary<string, string> runNames = [];
 
     public void RegisterRunName(string runId, string name)
     {
-        lock (gate) runNames[runId] = name;
+        lock (gate)
+        {
+            runNames[runId] = name;
+        }
     }
 
     public void ObserveTelemetry(TelemetryMessage telemetry, int windowSeconds)
@@ -36,32 +37,56 @@ public sealed class ScoringStore
             }
 
             var key = WindowMath.Assign(telemetry, windowSeconds);
-            if (!expectedWindows.TryGetValue(key, out var expected))
-            {
-                expected = new ExpectedWindow(key);
-                expectedWindows.Add(key, expected);
-            }
-
+            var expected = GetOrCreateExpectedWindow(key);
             expected.Aggregate.Add(telemetry.Value);
-            TouchScore(telemetry.RunId, telemetry.TeamId);
+
+            var score = TouchScore(telemetry.RunId, telemetry.TeamId);
+            score.ObservedTelemetryCount++;
+            score.LastUpdatedUtc = telemetry.PublishedAtUtc;
         }
     }
 
-    public void ObserveControl(ControlMessage control)
+    public void ObserveControl(ControlMessage control, int windowSeconds)
     {
         lock (gate)
         {
-            if (control.Event == Topics.PublisherComplete)
+            if (control.Event == Topics.PublisherStart
+                && control.DeviceCount is > 0
+                && control.MessageIntervalMs is > 0
+                && control.RunWindowSeconds is > 0)
             {
-                completedRuns[(control.RunId, control.TeamId)] = true;
+                var parameters = new RunParameters(
+                    control.DeviceCount.Value,
+                    control.MessageIntervalMs.Value,
+                    control.RunWindowSeconds.Value,
+                    control.PublishedAtUtc,
+                    windowSeconds);
+
+                runParams[(control.RunId, control.TeamId)] = parameters;
+
+                foreach (var expectation in RunMath.BuildWindowExpectations(
+                             control.PublishedAtUtc,
+                             control.RunWindowSeconds.Value,
+                             control.MessageIntervalMs.Value,
+                             windowSeconds))
+                {
+                    for (var deviceNumber = 1; deviceNumber <= control.DeviceCount.Value; deviceNumber++)
+                    {
+                        var key = new WindowKey(
+                            control.RunId,
+                            control.TeamId,
+                            $"device-{deviceNumber:000}",
+                            expectation.WindowStartUtc,
+                            expectation.WindowEndUtc);
+
+                        var expected = GetOrCreateExpectedWindow(key);
+                        expected.TheoreticalCount = expectation.ExpectedCountPerDevice;
+                    }
+                }
             }
 
-            if (control.Event == Topics.PublisherStart && (control.DeviceCount.HasValue || control.MessageIntervalMs.HasValue))
-            {
-                runParams[(control.RunId, control.TeamId)] = (control.DeviceCount, control.MessageIntervalMs);
-            }
-
-            TouchScore(control.RunId, control.TeamId);
+            var score = TouchScore(control.RunId, control.TeamId);
+            score.LastUpdatedUtc = control.PublishedAtUtc;
         }
     }
 
@@ -77,7 +102,7 @@ public sealed class ScoringStore
         lock (gate)
         {
             var score = TouchScore(result.RunId, result.TeamId);
-            if (scoredWindows.Contains(key) || missingWindows.Contains(key) || resultCandidates.ContainsKey(key))
+            if (finalizedWindows.Contains(key) || resultCandidates.ContainsKey(key))
             {
                 score.Invalid++;
                 Invalid.Add(1, new KeyValuePair<string, object?>("team_id", result.TeamId));
@@ -109,44 +134,54 @@ public sealed class ScoringStore
         {
             foreach (var (key, expected) in expectedWindows)
             {
-                if (scoredWindows.Contains(key) || missingWindows.Contains(key))
+                if (finalizedWindows.Contains(key))
                 {
                     continue;
                 }
 
-                var runComplete = completedRuns.GetValueOrDefault((key.RunId, key.TeamId));
                 if (now < key.WindowEndUtc.AddSeconds(graceSeconds).Add(FinalizationSlack))
                 {
                     continue;
                 }
 
                 var score = TouchScore(key.RunId, key.TeamId);
+                var observedCount = expected.Aggregate.Count;
+                var theoreticalCount = expected.TheoreticalCount;
+
+                if (observedCount != theoreticalCount)
+                {
+                    score.PublisherMismatchWindowCount++;
+                    finalizedWindows.Add(key);
+                    score.LastUpdatedUtc = now;
+                    continue;
+                }
+
+                score.FullyObservedWindowCount++;
+
                 if (resultCandidates.TryGetValue(key, out var candidate) && expected.Aggregate.Matches(candidate.Result))
                 {
                     score.Correct++;
                     Correct.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
                     score.LatenciesMs.Add(Math.Max(0, (candidate.ReceivedAtUtc - key.WindowEndUtc).TotalMilliseconds));
-                    scoredWindows.Add(key);
+                }
+                else if (resultCandidates.ContainsKey(key))
+                {
+                    score.Invalid++;
+                    Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
                 }
                 else
                 {
-                    if (resultCandidates.ContainsKey(key))
-                    {
-                        score.Invalid++;
-                        Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-                    }
-
                     score.Missing++;
                     Missing.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-                    missingWindows.Add(key);
                 }
 
+                finalizedWindows.Add(key);
                 score.LastUpdatedUtc = now;
             }
 
             foreach (var (key, candidate) in resultCandidates)
             {
-                if (expectedWindows.ContainsKey(key) || scoredWindows.Contains(key) || missingWindows.Contains(key))
+                if (expectedWindows.ContainsKey(key) || finalizedWindows.Contains(key))
                 {
                     continue;
                 }
@@ -159,7 +194,7 @@ public sealed class ScoringStore
                 var score = TouchScore(key.RunId, key.TeamId);
                 score.Invalid++;
                 Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-                missingWindows.Add(key);
+                finalizedWindows.Add(key);
                 score.LastUpdatedUtc = now;
             }
         }
@@ -190,6 +225,17 @@ public sealed class ScoringStore
         }
     }
 
+    private ExpectedWindow GetOrCreateExpectedWindow(WindowKey key)
+    {
+        if (!expectedWindows.TryGetValue(key, out var expected))
+        {
+            expected = new ExpectedWindow();
+            expectedWindows.Add(key, expected);
+        }
+
+        return expected;
+    }
+
     private ScoreState TouchScore(string runId, string teamId)
     {
         var key = (runId, teamId);
@@ -205,9 +251,41 @@ public sealed class ScoringStore
     private ScoreSnapshot ToSnapshot(string runId, string teamId, ScoreState state)
     {
         var latencyP95Ms = CalculateP95(state.LatenciesMs);
-        var score = state.Correct - 5 * state.Invalid - 3 * state.Missing - 0.05 * latencyP95Ms;
-        runParams.TryGetValue((runId, teamId), out var rp);
+        runParams.TryGetValue((runId, teamId), out var parameters);
+
+        var theoreticalTelemetryCount = parameters is null
+            ? 0
+            : RunMath.CalculateTheoreticalTelemetryCount(parameters.DeviceCount, parameters.RunWindowSeconds, parameters.MessageIntervalMs);
+        var expectedWindowCount = parameters?.ExpectedWindowCount ?? 0;
+        var intervalChallenge = parameters is null
+            ? 0
+            : ScoreMath.CalculateIntervalChallenge(parameters.MessageIntervalMs);
+        var deviceChallenge = parameters is null
+            ? 0
+            : ScoreMath.CalculateDeviceChallenge(parameters.DeviceCount);
+        var publishAttainment = theoreticalTelemetryCount == 0
+            ? 0
+            : Math.Min(1d, (double)state.ObservedTelemetryCount / theoreticalTelemetryCount);
+        var windowCorrectness = state.FullyObservedWindowCount == 0
+            ? 0
+            : (double)state.Correct / state.FullyObservedWindowCount;
+        var windowInvalidRate = state.FullyObservedWindowCount == 0
+            ? 0
+            : (double)state.Invalid / state.FullyObservedWindowCount;
+        var windowMissingRate = state.FullyObservedWindowCount == 0
+            ? 0
+            : (double)state.Missing / state.FullyObservedWindowCount;
+        var validatedVolumeBonus = ScoreMath.CalculateCorrectVolumeBonus(state.Correct);
+        var score = 1000 * intervalChallenge
+            + 1000 * deviceChallenge
+            + 1000 * publishAttainment
+            + 1000 * windowCorrectness
+            - 1200 * windowInvalidRate
+            - 800 * windowMissingRate
+            + validatedVolumeBonus
+            - 0.05 * latencyP95Ms;
         var name = runNames.GetValueOrDefault(runId, runId);
+
         return new ScoreSnapshot(
             runId,
             name,
@@ -219,8 +297,18 @@ public sealed class ScoringStore
             score,
             state.LastUpdatedUtc,
             "Running",
-            rp.DeviceCount,
-            rp.MessageIntervalMs);
+            parameters?.DeviceCount,
+            parameters?.MessageIntervalMs,
+            parameters?.RunWindowSeconds,
+            theoreticalTelemetryCount,
+            state.ObservedTelemetryCount,
+            publishAttainment,
+            expectedWindowCount,
+            state.FullyObservedWindowCount,
+            state.PublisherMismatchWindowCount,
+            windowCorrectness,
+            windowInvalidRate,
+            windowMissingRate);
     }
 
     private static double CalculateP95(IReadOnlyCollection<double> values)
@@ -235,22 +323,39 @@ public sealed class ScoringStore
         return ordered[Math.Clamp(index, 0, ordered.Length - 1)];
     }
 
-    private sealed class ExpectedWindow(WindowKey key)
+    private sealed class ExpectedWindow
     {
-        public WindowKey Key { get; } = key;
+        public int TheoreticalCount { get; set; }
 
         public AggregateWindow Aggregate { get; } = new();
     }
 
     private sealed record ResultCandidate(AggregateResultMessage Result, DateTimeOffset ReceivedAtUtc);
 
+    private sealed record RunParameters(
+        int DeviceCount,
+        int MessageIntervalMs,
+        int RunWindowSeconds,
+        DateTimeOffset RunStartedAtUtc,
+        int WindowSeconds)
+    {
+        public int ExpectedWindowCount =>
+            RunMath.BuildWindowExpectations(RunStartedAtUtc, RunWindowSeconds, MessageIntervalMs, WindowSeconds).Count * DeviceCount;
+    }
+
     private sealed class ScoreState
     {
+        public long ObservedTelemetryCount { get; set; }
+
         public int Correct { get; set; }
 
         public int Invalid { get; set; }
 
         public int Missing { get; set; }
+
+        public int FullyObservedWindowCount { get; set; }
+
+        public int PublisherMismatchWindowCount { get; set; }
 
         public List<double> LatenciesMs { get; } = [];
 

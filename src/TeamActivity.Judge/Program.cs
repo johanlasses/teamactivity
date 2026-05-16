@@ -10,6 +10,7 @@ builder.Services.AddSingleton<ScoringStore>();
 builder.Services.AddSingleton<ChaosStore>();
 builder.Services.AddSingleton<RunTriggerStore>();
 builder.Services.AddSingleton<ChaosScheduleTracker>();
+builder.Services.AddSingleton<RunAnnouncer>();
 builder.Services.AddHostedService<JudgeWorker>();
 
 var app = builder.Build();
@@ -52,7 +53,7 @@ app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore 
     return Results.Ok();
 });
 
-app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos, ScoringStore scoring, ObservedRunStore observedRunStore) =>
+app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, ChaosStore chaos, ScoringStore scoring, ObservedRunStore observedRunStore, RunAnnouncer announcer) =>
 {
     if (req.DeviceCount <= 0 || req.IntervalMs <= 0 || req.RunWindowSeconds <= 0)
         return Results.BadRequest("DeviceCount, IntervalMs, and RunWindowSeconds must be greater than 0.");
@@ -77,6 +78,9 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
         chaos.Enable(config.RunId);
     else
         chaos.Disable();
+
+    var trigger = new RunTriggerMessage(config.RunId, config.DeviceCount, config.IntervalMs, config.RunWindowSeconds, config.ChaosEnabled);
+    announcer.Announce(Topics.RunTrigger, System.Text.Json.JsonSerializer.Serialize(trigger, JsonContract.Options));
 
     return Results.Ok(config);
 });

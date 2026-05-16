@@ -12,4 +12,14 @@ public sealed record ScoreSnapshot(
     DateTimeOffset LastUpdatedUtc,
     string Status,
     int? DeviceCount,
-    int? MessageIntervalMs);
+    int? MessageIntervalMs,
+    int? RunWindowSeconds,
+    long TheoreticalTelemetryCount,
+    long ObservedTelemetryCount,
+    double PublishAttainment,
+    int ExpectedWindowCount,
+    int FullyObservedWindowCount,
+    int PublisherMismatchWindowCount,
+    double WindowCorrectness,
+    double WindowInvalidRate,
+    double WindowMissingRate);

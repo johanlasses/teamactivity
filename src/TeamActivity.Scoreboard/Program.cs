@@ -185,10 +185,15 @@ internal sealed record RunSnapshot(
     string RunId,
     string Name,
     IReadOnlyList<string> TeamIds,
-    int MessageCount,
-    int ValidMessageCount,
-    int InvalidMessageCount,
-    DateTimeOffset LastUpdatedUtc);
+    long MessageCount,
+    long ValidMessageCount,
+    long InvalidMessageCount,
+    DateTimeOffset LastUpdatedUtc,
+    long? TheoreticalTelemetryCount,
+    long TelemetryMessageCount,
+    double PublishAttainment,
+    long ResultMessageCount,
+    long ControlMessageCount);
 
 internal sealed record ScoreSnapshot(
     string RunId,
@@ -202,7 +207,17 @@ internal sealed record ScoreSnapshot(
     DateTimeOffset LastUpdatedUtc,
     string Status,
     int? DeviceCount,
-    int? MessageIntervalMs);
+    int? MessageIntervalMs,
+    int? RunWindowSeconds,
+    long TheoreticalTelemetryCount,
+    long ObservedTelemetryCount,
+    double PublishAttainment,
+    int ExpectedWindowCount,
+    int FullyObservedWindowCount,
+    int PublisherMismatchWindowCount,
+    double WindowCorrectness,
+    double WindowInvalidRate,
+    double WindowMissingRate);
 
 internal sealed record ChaosState(
     bool Enabled,
@@ -681,12 +696,15 @@ internal static class ScoreboardPage
             <th>Invalid</th>
             <th>Missing</th>
             <th>Latency p95 ms</th>
+            <th>Publish %</th>
+            <th>Publisher mismatch windows</th>
             <th>Devices</th>
             <th>Interval ms</th>
+            <th>Run s</th>
           </tr>
         </thead>
         <tbody id="scores">
-          <tr><td colspan="9" class="td-muted" style="padding:20px 12px">Waiting for scores…</td></tr>
+          <tr><td colspan="12" class="td-muted" style="padding:20px 12px">Waiting for scores…</td></tr>
         </tbody>
       </table>
     </div>
@@ -704,11 +722,16 @@ internal static class ScoreboardPage
             <th>Messages</th>
             <th>Valid</th>
             <th>Invalid</th>
+            <th>Theoretical telemetry</th>
+            <th>Telemetry seen</th>
+            <th>Publish %</th>
+            <th>Results</th>
+            <th>Control</th>
             <th>Last Update</th>
           </tr>
         </thead>
         <tbody id="runs">
-          <tr><td colspan="6" class="td-muted" style="padding:20px 12px">Waiting for Judge data…</td></tr>
+          <tr><td colspan="11" class="td-muted" style="padding:20px 12px">Waiting for Judge data…</td></tr>
         </tbody>
       </table>
     </div>
@@ -843,7 +866,7 @@ internal static class ScoreboardPage
     }
 
     async function refresh() {
-      const [runsResult, scoresResult, chaosResult, statusResult] = await Promise.allSettled([
+        const [runsResult, scoresResult, chaosResult, statusResult] = await Promise.allSettled([
         fetch('/api/runs').then(r => r.json()),
         fetch('/api/scores').then(r => r.json()),
         fetch('/api/chaos').then(r => r.json()),
@@ -862,11 +885,11 @@ internal static class ScoreboardPage
         }
       }
 
-      if (scoresResult.status === 'fulfilled') {
-        const scores = scoresResult.value;
-        const scoresBody = document.getElementById('scores');
-        if (!scores.length) {
-          scoresBody.innerHTML = '<tr><td colspan="9" class="td-muted" style="padding:20px 12px">No scores yet.</td></tr>';
+        if (scoresResult.status === 'fulfilled') {
+          const scores = scoresResult.value;
+          const scoresBody = document.getElementById('scores');
+          if (!scores.length) {
+          scoresBody.innerHTML = '<tr><td colspan="12" class="td-muted" style="padding:20px 12px">No scores yet.</td></tr>';
         } else {
           scoresBody.innerHTML = scores.map((score, i) => {
             const rank = i + 1;
@@ -879,8 +902,11 @@ internal static class ScoreboardPage
               <td class="${score.invalid ? 'td-bad' : ''}">${score.invalid}</td>
               <td class="${score.missing ? 'td-bad' : ''}">${score.missing}</td>
               <td>${score.latencyP95Ms.toFixed(0)}</td>
+              <td>${pct(score.publishAttainment)}</td>
+              <td class="${score.publisherMismatchWindowCount ? 'td-bad' : ''}">${score.publisherMismatchWindowCount}</td>
               <td>${score.deviceCount ?? '—'}</td>
               <td>${score.messageIntervalMs ?? '—'}</td>
+              <td>${score.runWindowSeconds ?? '—'}</td>
             </tr>`;
           }).join('');
         }
@@ -890,7 +916,7 @@ internal static class ScoreboardPage
         const runs = runsResult.value;
         const body = document.getElementById('runs');
         if (!runs.length) {
-          body.innerHTML = '<tr><td colspan="6" class="td-muted" style="padding:20px 12px">No runs observed yet.</td></tr>';
+          body.innerHTML = '<tr><td colspan="11" class="td-muted" style="padding:20px 12px">No runs observed yet.</td></tr>';
         } else {
           body.innerHTML = runs.map(run => `<tr>
             <td class="td-name" title="${esc(run.runId)}">${esc(run.name || run.runId)}</td>
@@ -898,10 +924,19 @@ internal static class ScoreboardPage
             <td>${run.messageCount}</td>
             <td>${run.validMessageCount}</td>
             <td class="${run.invalidMessageCount ? 'td-bad' : ''}">${run.invalidMessageCount}</td>
+            <td>${run.theoreticalTelemetryCount ?? '—'}</td>
+            <td>${run.telemetryMessageCount}</td>
+            <td>${pct(run.publishAttainment)}</td>
+            <td>${run.resultMessageCount}</td>
+            <td>${run.controlMessageCount}</td>
             <td style="color:var(--muted);font-size:13px">${new Date(run.lastUpdatedUtc).toLocaleString()}</td>
           </tr>`).join('');
         }
       }
+    }
+
+    function pct(value) {
+      return `${(Math.max(0, Math.min(1, value || 0)) * 100).toFixed(1)}%`;
     }
 
     function updateChaosBanner(chaos) {

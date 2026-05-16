@@ -69,4 +69,60 @@ public sealed class ContractTests
         Assert.Equal("device-1", deviceId);
         Assert.Equal(windowStart.ToUnixTimeMilliseconds(), windowStartUnixMs);
     }
+
+    [Fact]
+    public void RunMathScalesTheoreticalTelemetryByDeviceCount()
+    {
+        var total = RunMath.CalculateTheoreticalTelemetryCount(deviceCount: 3, runWindowSeconds: 120, intervalMs: 250);
+
+        Assert.Equal(1_440, total);
+    }
+
+    [Fact]
+    public void RunMathBuildsPerWindowExpectationsFromRunStart()
+    {
+        var runStart = DateTimeOffset.Parse("2026-05-07T20:17:34.900Z");
+        var expectations = RunMath.BuildWindowExpectations(runStart, runWindowSeconds: 12, intervalMs: 250, windowSeconds: 5);
+
+        Assert.Collection(
+            expectations,
+            window =>
+            {
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:30Z"), window.WindowStartUtc);
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:35Z"), window.WindowEndUtc);
+                Assert.Equal(1, window.ExpectedCountPerDevice);
+            },
+            window =>
+            {
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:35Z"), window.WindowStartUtc);
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:40Z"), window.WindowEndUtc);
+                Assert.Equal(20, window.ExpectedCountPerDevice);
+            },
+            window =>
+            {
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:40Z"), window.WindowStartUtc);
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:45Z"), window.WindowEndUtc);
+                Assert.Equal(20, window.ExpectedCountPerDevice);
+            },
+            window =>
+            {
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:45Z"), window.WindowStartUtc);
+                Assert.Equal(DateTimeOffset.Parse("2026-05-07T20:17:50Z"), window.WindowEndUtc);
+                Assert.Equal(7, window.ExpectedCountPerDevice);
+            });
+    }
+
+    [Fact]
+    public void ScoreMathRewardsLowerIntervalsAgainstFiftyMillisecondBaseline()
+    {
+        Assert.Equal(1d, ScoreMath.CalculateIntervalChallenge(50));
+        Assert.Equal(0.2d, ScoreMath.CalculateIntervalChallenge(250), 6);
+    }
+
+    [Fact]
+    public void ScoreMathRewardsMoreDevicesAgainstTenThousandBaseline()
+    {
+        Assert.Equal(1d, ScoreMath.CalculateDeviceChallenge(10_000));
+        Assert.Equal(0.01d, ScoreMath.CalculateDeviceChallenge(100), 6);
+    }
 }

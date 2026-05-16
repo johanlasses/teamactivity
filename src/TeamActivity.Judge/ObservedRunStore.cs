@@ -1,3 +1,5 @@
+using TeamActivity.Shared.Contracts;
+
 namespace TeamActivity.Judge;
 
 public sealed class ObservedRunStore
@@ -7,10 +9,20 @@ public sealed class ObservedRunStore
     private readonly object gate = new();
     private readonly Dictionary<string, List<ObservedMessage>> messagesByRun = [];
     private readonly Dictionary<string, string> runNames = [];
+    private readonly Dictionary<string, RunTrafficState> runTrafficByRun = [];
 
     public void RegisterRunName(string runId, string name)
     {
         lock (gate) runNames[runId] = name;
+    }
+
+    public void RegisterRunParameters(string runId, int deviceCount, int messageIntervalMs, int runWindowSeconds)
+    {
+        lock (gate)
+        {
+            var traffic = GetOrCreateTraffic(runId);
+            traffic.TheoreticalTelemetryCount = RunMath.CalculateTheoreticalTelemetryCount(deviceCount, runWindowSeconds, messageIntervalMs);
+        }
     }
 
     public void AddMessage(ObservedMessage message)
@@ -28,6 +40,33 @@ public sealed class ObservedRunStore
             {
                 messages.RemoveRange(0, messages.Count - MaxMessagesPerRun);
             }
+
+            var traffic = GetOrCreateTraffic(message.RunId);
+            traffic.TeamIds.Add(message.TeamId);
+            traffic.MessageCount++;
+            traffic.LastUpdatedUtc = message.ReceivedAtUtc;
+
+            if (message.IsValid)
+            {
+                traffic.ValidMessageCount++;
+            }
+            else
+            {
+                traffic.InvalidMessageCount++;
+            }
+
+            switch (message.Kind)
+            {
+                case "telemetry":
+                    traffic.TelemetryMessageCount++;
+                    break;
+                case "result":
+                    traffic.ResultMessageCount++;
+                    break;
+                case "control":
+                    traffic.ControlMessageCount++;
+                    break;
+            }
         }
     }
 
@@ -35,19 +74,27 @@ public sealed class ObservedRunStore
     {
         lock (gate)
         {
-            return messagesByRun
+            return runTrafficByRun
                 .Select(entry =>
                 {
-                    var messages = entry.Value;
                     var name = runNames.GetValueOrDefault(entry.Key, entry.Key);
+                    var traffic = entry.Value;
+                    var publishAttainment = traffic.TheoreticalTelemetryCount > 0
+                        ? Math.Min(1d, (double)traffic.TelemetryMessageCount / traffic.TheoreticalTelemetryCount.Value)
+                        : 0d;
                     return new RunSnapshot(
                         entry.Key,
                         name,
-                        messages.Select(message => message.TeamId).Distinct().Order().ToArray(),
-                        messages.Count,
-                        messages.Count(message => message.IsValid),
-                        messages.Count(message => !message.IsValid),
-                        messages.Max(message => message.ReceivedAtUtc));
+                        traffic.TeamIds.Order().ToArray(),
+                        traffic.MessageCount,
+                        traffic.ValidMessageCount,
+                        traffic.InvalidMessageCount,
+                        traffic.LastUpdatedUtc,
+                        traffic.TheoreticalTelemetryCount,
+                        traffic.TelemetryMessageCount,
+                        publishAttainment,
+                        traffic.ResultMessageCount,
+                        traffic.ControlMessageCount);
                 })
                 .OrderBy(snapshot => snapshot.RunId)
                 .ToArray();
@@ -63,13 +110,50 @@ public sealed class ObservedRunStore
                 : [];
         }
     }
+
+    private RunTrafficState GetOrCreateTraffic(string runId)
+    {
+        if (!runTrafficByRun.TryGetValue(runId, out var traffic))
+        {
+            traffic = new RunTrafficState();
+            runTrafficByRun.Add(runId, traffic);
+        }
+
+        return traffic;
+    }
 }
 
 public sealed record RunSnapshot(
     string RunId,
     string Name,
     IReadOnlyList<string> TeamIds,
-    int MessageCount,
-    int ValidMessageCount,
-    int InvalidMessageCount,
-    DateTimeOffset LastUpdatedUtc);
+    long MessageCount,
+    long ValidMessageCount,
+    long InvalidMessageCount,
+    DateTimeOffset LastUpdatedUtc,
+    long? TheoreticalTelemetryCount,
+    long TelemetryMessageCount,
+    double PublishAttainment,
+    long ResultMessageCount,
+    long ControlMessageCount);
+
+sealed class RunTrafficState
+{
+    public HashSet<string> TeamIds { get; } = [];
+
+    public long MessageCount { get; set; }
+
+    public long ValidMessageCount { get; set; }
+
+    public long InvalidMessageCount { get; set; }
+
+    public long TelemetryMessageCount { get; set; }
+
+    public long ResultMessageCount { get; set; }
+
+    public long ControlMessageCount { get; set; }
+
+    public long? TheoreticalTelemetryCount { get; set; }
+
+    public DateTimeOffset LastUpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
+}
