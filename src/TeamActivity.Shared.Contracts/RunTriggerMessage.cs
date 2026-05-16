@@ -5,4 +5,7 @@ public sealed record RunTriggerMessage(
     int DeviceCount,
     int IntervalMs,
     int RunWindowSeconds,
-    bool ChaosEnabled);
+    bool ChaosEnabled)
+{
+    public string? TraceParent { get; init; }
+}

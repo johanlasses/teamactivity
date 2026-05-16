@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text;
 using System.Text.Json;
@@ -85,6 +86,16 @@ public sealed class Worker(
         ChallengeOptions challenge,
         CancellationToken stoppingToken)
     {
+        ActivityContext parentContext = default;
+        bool hasParent = !string.IsNullOrEmpty(trigger.TraceParent)
+            && ActivityContext.TryParse(trigger.TraceParent, null, isRemote: true, out parentContext);
+
+        using var activity = TelemetryActivitySources.Publisher.StartActivity(
+            "run.execute",
+            ActivityKind.Consumer,
+            hasParent ? parentContext : default);
+        activity?.SetTag("run.id", trigger.RunId);
+
         var intervalMs = trigger.IntervalMs;
         var deviceCount = Math.Max(1, trigger.DeviceCount);
         var runWindowSeconds = Math.Max(1, trigger.RunWindowSeconds);
@@ -139,7 +150,8 @@ public sealed class Worker(
             }
         }
 
-        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken);
+        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken,
+            traceParent: activity?.Id);
     }
 
     private static Task PublishControl(
@@ -150,7 +162,8 @@ public sealed class Worker(
         CancellationToken cancellationToken,
         int? deviceCount = null,
         int? messageIntervalMs = null,
-        int? runWindowSeconds = null)
+        int? runWindowSeconds = null,
+        string? traceParent = null)
     {
         var control = new ControlMessage(
             Topics.SchemaVersion,
@@ -161,7 +174,8 @@ public sealed class Worker(
         {
             DeviceCount = deviceCount,
             MessageIntervalMs = messageIntervalMs,
-            RunWindowSeconds = runWindowSeconds
+            RunWindowSeconds = runWindowSeconds,
+            TraceParent = traceParent
         };
 
         var topic = Topics.Control(runId, teamId, eventName);

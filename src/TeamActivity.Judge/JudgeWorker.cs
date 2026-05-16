@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text;
 using System.Text.Json;
@@ -180,7 +181,7 @@ public sealed class JudgeWorker(
                         {
                             var cts = new CancellationTokenSource();
                             scheduleTracker.Register(control.RunId, cts);
-                            _ = ChaosSchedule.RunAsync(chaosStore, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+                            _ = ChaosSchedule.RunAsync(chaosStore, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
                         }
                     }
                     logger.LogInformation(
@@ -191,6 +192,18 @@ public sealed class JudgeWorker(
                 {
                     runTriggers.Complete(control.RunId);
                     scheduleTracker.Cancel(control.RunId);
+
+                    ActivityContext parentContext = default;
+                    bool hasParent = !string.IsNullOrEmpty(control.TraceParent)
+                        && ActivityContext.TryParse(control.TraceParent, null, isRemote: true, out parentContext);
+
+                    using var activity = TelemetryActivitySources.Judge.StartActivity(
+                        "run.completed",
+                        ActivityKind.Consumer,
+                        hasParent ? parentContext : default);
+                    activity?.SetTag("run.id", control.RunId);
+                    activity?.SetTag("team.id", control.TeamId);
+
                     logger.LogInformation("Run complete: RunId={RunId} Team={TeamId}", control.RunId, control.TeamId);
                 }
                 ControlReceived.Add(1, new KeyValuePair<string, object?>("event", control.Event));

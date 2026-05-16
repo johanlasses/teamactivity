@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using TeamActivity.Judge;
 using TeamActivity.Shared.Contracts;
 
@@ -36,7 +37,7 @@ app.MapGet("/api/run/pending", (RunTriggerStore triggers) =>
 
 app.MapGet("/api/chaos/schedule", () => Results.Ok(ChaosSchedule.DefaultSchedule));
 
-app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker) =>
+app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker, ILogger<Program> logger) =>
 {
     if (!triggers.TryAcknowledge(req.RunId))
         return Results.Conflict("Run acknowledgement failed — state may have changed.");
@@ -47,7 +48,7 @@ app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore 
     {
         var cts = new CancellationTokenSource();
         scheduleTracker.Register(req.RunId, cts);
-        _ = ChaosSchedule.RunAsync(chaos, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+        _ = ChaosSchedule.RunAsync(chaos, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
     }
 
     return Results.Ok();
@@ -79,7 +80,15 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
     else
         chaos.Disable();
 
-    var trigger = new RunTriggerMessage(config.RunId, config.DeviceCount, config.IntervalMs, config.RunWindowSeconds, config.ChaosEnabled);
+    using var activity = TelemetryActivitySources.Judge.StartActivity("run.triggered", ActivityKind.Producer);
+    activity?.SetTag("run.id", config.RunId);
+    activity?.SetTag("run.name", config.Name);
+    activity?.SetTag("run.device_count", config.DeviceCount);
+
+    var trigger = new RunTriggerMessage(config.RunId, config.DeviceCount, config.IntervalMs, config.RunWindowSeconds, config.ChaosEnabled)
+    {
+        TraceParent = activity?.Id
+    };
     announcer.Announce(Topics.RunTrigger, System.Text.Json.JsonSerializer.Serialize(trigger, JsonContract.Options));
 
     return Results.Ok(config);
@@ -95,21 +104,23 @@ app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos, ChaosS
     return cancelled ? Results.Ok() : Results.Conflict("No run in progress.");
 });
 
-app.MapPost("/api/chaos/enable", (ChaosEnableRequest req, ChaosStore chaos, HttpContext ctx) =>
+app.MapPost("/api/chaos/enable", (ChaosEnableRequest req, ChaosStore chaos, ILogger<Program> logger, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();
     chaos.Enable(req.RunId);
+    logger.LogInformation("Chaos enabled for RunId={RunId}", req.RunId);
     return Results.Ok(chaos.GetState());
 });
 
-app.MapPost("/api/chaos/disable", (ChaosStore chaos, HttpContext ctx) =>
+app.MapPost("/api/chaos/disable", (ChaosStore chaos, ILogger<Program> logger, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();
     chaos.Disable();
+    logger.LogInformation("Chaos disabled");
     return Results.Ok(chaos.GetState());
 });
 
-app.MapPost("/api/chaos/event/start", (ChaosEventStartRequest req, ChaosStore chaos, HttpContext ctx) =>
+app.MapPost("/api/chaos/event/start", (ChaosEventStartRequest req, ChaosStore chaos, ILogger<Program> logger, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();
     if (!ChaosStore.AllowedEventTypes.Contains(req.Type))
@@ -118,13 +129,22 @@ app.MapPost("/api/chaos/event/start", (ChaosEventStartRequest req, ChaosStore ch
             $"Unknown event type '{req.Type}'. Allowed: {string.Join(", ", ChaosStore.AllowedEventTypes)}");
     }
     chaos.StartEvent(req.Type, req.Description ?? string.Empty);
+    logger.LogInformation("Chaos event started: Type={EventType} Description={Description}", req.Type, req.Description);
     return Results.Ok(chaos.GetState());
 });
 
-app.MapPost("/api/chaos/event/end", (ChaosStore chaos, HttpContext ctx) =>
+app.MapPost("/api/chaos/event/end", (ChaosStore chaos, ILogger<Program> logger, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();
+    var ending = chaos.GetState().ActiveEvent;
     chaos.EndEvent();
+    if (ending is not null)
+    {
+        var duration = DateTimeOffset.UtcNow - ending.StartedAtUtc;
+        logger.LogInformation(
+            "Chaos event ended: Type={EventType} Duration={DurationSeconds:F1}s",
+            ending.Type, duration.TotalSeconds);
+    }
     return Results.Ok(chaos.GetState());
 });
 

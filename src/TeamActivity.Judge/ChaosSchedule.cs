@@ -24,6 +24,7 @@ public static class ChaosSchedule
 
     public static async Task RunAsync(
         ChaosStore chaos,
+        ILogger logger,
         DateTimeOffset startedAtUtc,
         IEnumerable<ChaosScheduleEntry> schedule,
         CancellationToken cancellationToken)
@@ -41,9 +42,24 @@ public static class ChaosSchedule
             if (cancellationToken.IsCancellationRequested) break;
 
             if (entry.Action == "start" && entry.EventType is not null)
+            {
                 chaos.StartEvent(entry.EventType, entry.Description ?? string.Empty);
+                logger.LogInformation(
+                    "Chaos event started: Type={EventType} Description={Description}",
+                    entry.EventType, entry.Description);
+            }
             else if (entry.Action == "end")
+            {
+                var ending = chaos.GetState().ActiveEvent;
                 chaos.EndEvent();
+                if (ending is not null)
+                {
+                    var duration = DateTimeOffset.UtcNow - ending.StartedAtUtc;
+                    logger.LogInformation(
+                        "Chaos event ended: Type={EventType} Duration={DurationSeconds:F1}s",
+                        ending.Type, duration.TotalSeconds);
+                }
+            }
         }
     }
 }

@@ -12,4 +12,6 @@ public sealed record ControlMessage(
     public int? MessageIntervalMs { get; init; }
 
     public int? RunWindowSeconds { get; init; }
+
+    public string? TraceParent { get; init; }
 }
