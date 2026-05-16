@@ -15,7 +15,9 @@ public sealed class JudgeWorker(
     ScoringStore scoring,
     ObservedRunStore store,
     RunTriggerStore runTriggers,
-    ChaosScheduleTracker scheduleTracker) : BackgroundService
+    ChaosScheduleTracker scheduleTracker,
+    ChaosStore chaosStore,
+    RunAnnouncer announcer) : BackgroundService
 {
     private static readonly Counter<long> RawReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_raw_received_total");
     private static readonly Counter<long> ResultsReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_results_received_total");
@@ -58,10 +60,34 @@ public sealed class JudgeWorker(
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
         logger.LogInformation("Judge subscribed to telemetry, result, and control topics.");
 
+        var drainTask = DrainAnnouncementsAsync(client, stoppingToken);
+
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             scoring.FinalizeDueWindows(challengeOptions.Value.GraceSeconds);
+        }
+
+        await drainTask;
+    }
+
+    private async Task DrainAnnouncementsAsync(IMqttClient client, CancellationToken stoppingToken)
+    {
+        await foreach (var (topic, json) in announcer.Reader.ReadAllAsync(stoppingToken))
+        {
+            try
+            {
+                var message = new MqttApplicationMessageBuilder()
+                    .WithTopic(topic)
+                    .WithPayload(json)
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                    .Build();
+                await client.PublishAsync(message, stoppingToken);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to publish announcement to MQTT topic {Topic}", topic);
+            }
         }
     }
 
@@ -111,7 +137,8 @@ public sealed class JudgeWorker(
                 RawReceived.Add(1, new KeyValuePair<string, object?>("team_id", telemetry.TeamId));
             }
 
-            logger.LogInformation("Judge observed telemetry on {Topic}. Valid={Valid}", topic, error is null);
+            if (error is not null)
+                logger.LogWarning("Judge rejected telemetry on {Topic}: {Error}", topic, error);
         }
         catch (JsonException ex)
         {
@@ -139,16 +166,38 @@ public sealed class JudgeWorker(
 
             if (control is not null && error is null)
             {
-                scoring.ObserveControl(control);
+                scoring.ObserveControl(control, challengeOptions.Value.WindowSeconds);
+                if (control.Event == Topics.PublisherStart
+                    && control.DeviceCount is > 0
+                    && control.MessageIntervalMs is > 0
+                    && control.RunWindowSeconds is > 0)
+                {
+                    store.RegisterRunParameters(control.RunId, control.DeviceCount.Value, control.MessageIntervalMs.Value, control.RunWindowSeconds.Value);
+                    if (runTriggers.TryAcknowledge(control.RunId))
+                    {
+                        var status = runTriggers.GetStatus();
+                        if (status.Config?.ChaosScheduleEnabled == true && status.StartedAtUtc.HasValue)
+                        {
+                            var cts = new CancellationTokenSource();
+                            scheduleTracker.Register(control.RunId, cts);
+                            _ = ChaosSchedule.RunAsync(chaosStore, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+                        }
+                    }
+                    logger.LogInformation(
+                        "Run started: RunId={RunId} Team={TeamId} Devices={DeviceCount} Interval={IntervalMs}ms Window={WindowSeconds}s",
+                        control.RunId, control.TeamId, control.DeviceCount, control.MessageIntervalMs, control.RunWindowSeconds);
+                }
                 if (control.Event == Topics.PublisherComplete)
                 {
                     runTriggers.Complete(control.RunId);
                     scheduleTracker.Cancel(control.RunId);
+                    logger.LogInformation("Run complete: RunId={RunId} Team={TeamId}", control.RunId, control.TeamId);
                 }
                 ControlReceived.Add(1, new KeyValuePair<string, object?>("event", control.Event));
             }
 
-            logger.LogInformation("Judge observed control event {Event} on {Topic}. Valid={Valid}", eventName, topic, error is null);
+            if (error is not null)
+                logger.LogWarning("Judge rejected control event {Event} on {Topic}: {Error}", eventName, topic, error);
         }
         catch (JsonException ex)
         {
@@ -191,7 +240,8 @@ public sealed class JudgeWorker(
                 scoring.AddInvalid(topicRunId, topicTeamId);
             }
 
-            logger.LogInformation("Judge observed aggregate result on {Topic}. Valid={Valid}", topic, error is null);
+            if (error is not null)
+                logger.LogWarning("Judge rejected result on {Topic}: {Error}", topic, error);
         }
         catch (JsonException ex)
         {
@@ -241,6 +291,12 @@ public sealed class JudgeWorker(
         if (control.RunId != topicRunId || control.TeamId != topicTeamId || control.Event != eventName)
         {
             return "Payload runId/teamId/event did not match the MQTT topic.";
+        }
+
+        if (eventName == Topics.PublisherStart
+            && (control.DeviceCount is null || control.MessageIntervalMs is null || control.RunWindowSeconds is null))
+        {
+            return "publisher-start must include deviceCount, messageIntervalMs, and runWindowSeconds.";
         }
 
         return eventName is Topics.PublisherStart or Topics.PublisherComplete

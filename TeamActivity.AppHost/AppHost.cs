@@ -16,6 +16,7 @@ var judge = builder.AddDockerfile("judge", "..", "src/TeamActivity.Judge/Dockerf
     .WithHttpEndpoint(port: 5076, targetPort: 8080, name: "http")
     .WithEnvironment("MQTT__Host", "mosquitto")
     .WithEnvironment("MQTT__Port", "1883")
+    .WithOtlpExporter()
     .WaitFor(mqtt);
 
 var processor = builder.AddProject<Projects.TeamActivity_Processor>("processor")
@@ -27,14 +28,13 @@ builder.AddProject<Projects.TeamActivity_Publisher>("publisher")
     .WithEnvironment("MQTT__Host", "localhost")
     .WithEnvironment("MQTT__Port", "1883")
     .WithEnvironment("Publisher__StartupDelaySeconds", "3")
-    .WithReference(judge.GetEndpoint("http"))
     .WaitFor(mqtt)
-    .WaitFor(judge)
     .WaitFor(processor);
 
 builder.AddDockerfile("scoreboard", "..", "src/TeamActivity.Scoreboard/Dockerfile")
     .WithHttpEndpoint(port: 5216, targetPort: 8080, name: "http")
     .WithReference(judge.GetEndpoint("http"))
+    .WithOtlpExporter()
     .WaitFor(judge);
 
 builder.Build().Run();
