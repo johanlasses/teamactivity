@@ -1,0 +1,102 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/johanlasses/teamactivity
+
+jobs:
+  publish-judge:
+    name: Publish Judge image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Judge
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: src/TeamActivity.Judge/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/judge:${{ steps.version.outputs.VERSION }}
+            ${{ env.IMAGE_PREFIX }}/judge:latest
+
+  publish-scoreboard:
+    name: Publish Scoreboard image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Scoreboard
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: src/TeamActivity.Scoreboard/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/scoreboard:${{ steps.version.outputs.VERSION }}
+            ${{ env.IMAGE_PREFIX }}/scoreboard:latest
+
+  publish-nuget:
+    name: Publish Shared.Contracts NuGet
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Pack
+        run: |
+          dotnet pack src/TeamActivity.Shared.Contracts/TeamActivity.Shared.Contracts.csproj \
+            -c Release \
+            -p:Version=${{ steps.version.outputs.VERSION }} \
+            -o ./nupkg
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push ./nupkg/*.nupkg \
+            --source https://nuget.pkg.github.com/johanlasses/index.json \
+            --api-key ${{ secrets.GITHUB_TOKEN }}
