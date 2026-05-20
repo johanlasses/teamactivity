@@ -257,12 +257,6 @@ public sealed class ScoringStore
             ? 0
             : RunMath.CalculateTheoreticalTelemetryCount(parameters.DeviceCount, parameters.RunWindowSeconds, parameters.MessageIntervalMs);
         var expectedWindowCount = parameters?.ExpectedWindowCount ?? 0;
-        var intervalChallenge = parameters is null
-            ? 0
-            : ScoreMath.CalculateIntervalChallenge(parameters.MessageIntervalMs);
-        var deviceChallenge = parameters is null
-            ? 0
-            : ScoreMath.CalculateDeviceChallenge(parameters.DeviceCount);
         var publishAttainment = theoreticalTelemetryCount == 0
             ? 0
             : Math.Min(1d, (double)state.ObservedTelemetryCount / theoreticalTelemetryCount);
@@ -275,15 +269,13 @@ public sealed class ScoringStore
         var windowMissingRate = state.FullyObservedWindowCount == 0
             ? 0
             : (double)state.Missing / state.FullyObservedWindowCount;
-        var validatedVolumeBonus = ScoreMath.CalculateCorrectVolumeBonus(state.Correct);
-        var score = 1000 * intervalChallenge
-            + 1000 * deviceChallenge
-            + 1000 * publishAttainment
-            + 1000 * windowCorrectness
-            - 1200 * windowInvalidRate
-            - 800 * windowMissingRate
-            + validatedVolumeBonus
-            - 0.05 * latencyP95Ms;
+
+        var intervalScore = parameters is null ? 0 : ScoreMath.CalculateIntervalScore(parameters.MessageIntervalMs);
+        var deviceScore = parameters is null ? 0 : ScoreMath.CalculateDeviceScore(parameters.DeviceCount);
+        var publishAttainmentScore = ScoreMath.CalculatePublishAttainmentScore(publishAttainment);
+        var windowCorrectnessScore = ScoreMath.CalculateWindowCorrectnessScore(windowCorrectness);
+        var latencyScore = ScoreMath.CalculateLatencyScore(latencyP95Ms);
+        var score = intervalScore + deviceScore + publishAttainmentScore + windowCorrectnessScore + latencyScore;
         var name = runNames.GetValueOrDefault(runId, runId);
 
         return new ScoreSnapshot(
@@ -308,7 +300,12 @@ public sealed class ScoringStore
             state.PublisherMismatchWindowCount,
             windowCorrectness,
             windowInvalidRate,
-            windowMissingRate);
+            windowMissingRate,
+            intervalScore,
+            deviceScore,
+            publishAttainmentScore,
+            windowCorrectnessScore,
+            latencyScore);
     }
 
     private static double CalculateP95(IReadOnlyCollection<double> values)

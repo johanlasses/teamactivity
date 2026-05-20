@@ -22,4 +22,9 @@ public sealed record ScoreSnapshot(
     int PublisherMismatchWindowCount,
     double WindowCorrectness,
     double WindowInvalidRate,
-    double WindowMissingRate);
+    double WindowMissingRate,
+    double IntervalScore,
+    double DeviceScore,
+    double PublishAttainmentScore,
+    double WindowCorrectnessScore,
+    double LatencyScore);

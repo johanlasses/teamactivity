@@ -51,7 +51,9 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
         // Chaos must be off
         await page.UncheckAsync("#chaos-mode");
 
-        // Set a short run window
+        // Set known run parameters so scoring assertions are deterministic
+        await page.FillAsync("#device-count", "3");
+        await page.FillAsync("#message-interval", "250");
         await page.FillAsync("#run-window", "10");
         await page.ClickAsync("#start-btn");
 
@@ -62,6 +64,9 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
 
         var feedback = await page.TextContentAsync("#start-feedback") ?? string.Empty;
         Assert.StartsWith("Run started:", feedback.Trim(), StringComparison.OrdinalIgnoreCase);
+
+        // Capture the run name so we can target this specific row later (avoids matching stale rows)
+        var runName = feedback.Trim()["Run started:".Length..].Trim();
 
         // Wait for the run to reach Running state
         await page.WaitForFunctionAsync(
@@ -102,6 +107,73 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
         Assert.True(correctValue > 0,
             $"Expected a team-template row with correct > 0 but got {correctValue}. " +
             $"Table snapshot: [{string.Join(" | ", tableSnapshot)}]");
+
+        // ── Scoring 2.0 widget assertions ─────────────────────────────────────
+
+        // Score column must show "/ 5000" (Scoring 2.0 max) — pass runName as a JS argument
+        var scoreText = await page.EvaluateAsync<string>(
+            """
+            (name) => {
+                const rows = document.querySelectorAll('#scores tr.expand-row');
+                for (const row of rows) {
+                    if (row.textContent.includes(name)) {
+                        return row.querySelectorAll('td')[2]?.textContent ?? '';
+                    }
+                }
+                return '';
+            }
+            """, runName);
+        Assert.Contains("/ 5000", scoreText, StringComparison.Ordinal);
+
+        // Expand the score breakdown widget by clicking the row
+        await page.EvaluateAsync(
+            """
+            (name) => {
+                const rows = document.querySelectorAll('#scores tr.expand-row');
+                for (const row of rows) {
+                    if (row.textContent.includes(name)) { row.click(); return; }
+                }
+            }
+            """, runName);
+
+        // Wait for the detail row to become visible with all 5 bars
+        await page.WaitForFunctionAsync(
+            """
+            () => {
+                const details = document.querySelectorAll('#scores tr.score-detail-row');
+                for (const detail of details) {
+                    if (detail.style.display === 'none') continue;
+                    if (detail.querySelectorAll('.bar-value').length === 5) return true;
+                }
+                return false;
+            }
+            """,
+            null, new PageWaitForFunctionOptions { Timeout = 5_000 });
+
+        // Read bar values in order: Interval, Devices, Publish Attainment, Window Correctness, Latency
+        var barValues = await page.EvaluateAsync<string[]>(
+            """
+            (() => {
+                const details = document.querySelectorAll('#scores tr.score-detail-row');
+                for (const detail of details) {
+                    if (detail.style.display === 'none') continue;
+                    const vals = Array.from(detail.querySelectorAll('.bar-value')).map(el => el.textContent.trim());
+                    if (vals.length === 5) return vals;
+                }
+                return [];
+            })()
+            """);
+
+        Assert.True(barValues.Length == 5,
+            $"Expected 5 score breakdown bars but got {barValues.Length}. Values: [{string.Join(", ", barValues)}]");
+
+        // Interval bar: 250 ms → 1000 × (1000 − 250) / (1000 − 50) ≈ 789 pts (fixed at run start)
+        var intervalBarScore = int.Parse(barValues[0]);
+        Assert.InRange(intervalBarScore, 788, 791);
+
+        // Device bar: 3 devices → 1000 × 3 / 50 000 ≈ 0 pts (fixed at run start)
+        var deviceBarScore = int.Parse(barValues[1]);
+        Assert.InRange(deviceBarScore, 0, 1);
     }
 
     // ── Scenario 2: Chaos enabled ─────────────────────────────────────────────

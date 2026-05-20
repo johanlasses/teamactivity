@@ -207,30 +207,29 @@ windowEnd   = windowStart + 5000 ms
 
 ## Scoring
 
-The Judge combines **four main criteria** — interval challenge, device challenge, publisher attainment, and processor correctness — once windows have cleared the grace period.
+The maximum score is **5000 points**, made up of five categories worth **1000 points each**. Each category scores linearly between its best and worst values.
 
-```
-Score =
-  1000 × IntervalChallenge
-  + 1000 × DeviceChallenge
-  + 1000 × PublishAttainment
-  + 1000 × WindowCorrectness
-  − 1200 × WindowInvalidRate
-  − 800 × WindowMissingRate
-  + 10 × log10(1 + Correct)
-  − 0.05 × LatencyP95ms
-```
+| Category | 1000 pts (best) | 0 pts (worst) | When |
+|---|---|---|---|
+| **Interval** | 50 ms | 1000 ms | Fixed at run start |
+| **Devices** | 50 000 devices | 1 device | Fixed at run start |
+| **Publish Attainment** | 100% published | 0% published | Live |
+| **Window Correctness** | 100% correct windows | 0% correct windows | Live |
+| **Latency** | 100 ms P95 | ≥ 1000 ms P95 | Live |
 
-| Term | Definition |
-|---|---|
-| **IntervalChallenge** | `min(1, 50 / intervalMs)` so `50 ms` gets full points and higher intervals scale down |
-| **DeviceChallenge** | `min(1, deviceCount / 10000)` so `10,000` devices gets full points and smaller runs scale down |
-| **PublishAttainment** | `broker-observed telemetry / theoretical telemetry`, capped at `1.0` |
-| **WindowCorrectness** | `correct windows / fully observed windows` |
-| **WindowInvalidRate** | `invalid windows / fully observed windows` |
-| **WindowMissingRate** | `missing windows / fully observed windows` |
-| **Correct volume bonus** | `10 × log10(1 + Correct)` so each 10× increase in correct windows adds a modest bonus |
-| **LatencyP95ms** | 95th-percentile of `(result received at Judge − windowEnd)` across all correct results (in milliseconds) |
+**Total score = sum of all five categories** (max 5000).
+
+### Category formulas
+
+- **Interval score** `= max(0, min(1000, 1000 × (1000 − intervalMs) / 950))`
+- **Devices score** `= max(0, min(1000, 1000 × deviceCount / 50 000))`
+- **Publish Attainment score** `= max(0, min(1000, 1000 × publishAttainment))`
+- **Window Correctness score** `= max(0, min(1000, 1000 × windowCorrectness))`
+- **Latency score** `= max(0, min(1000, 1000 × (1000 − latencyP95ms) / 900))` _(0 if no data yet)_
+
+### Scoreboard display
+
+The scoreboard shows a live bar widget for each run — one horizontal bar per category, coloured from red (0) to green (1000). The **Interval** and **Devices** bars are fixed as soon as the run starts; the remaining three update every few seconds during the run.
 
 ### Window validation rules
 
@@ -238,8 +237,7 @@ Score =
 - The Judge also counts how many telemetry messages actually reached the broker for each device/window.
 - A window is **fully observed** only when the broker-observed count matches the theoretical count.
 - Processor results are scored as **Correct**, **Invalid**, or **Missing** only for fully observed windows.
-- Windows where the publisher did not hit the theoretical count are tracked separately as **publisher mismatch windows** and affect total score through publish attainment instead of being double-penalised as processor failures.
-- Interval and device challenge scores are each **capped at 1.0**, so teams cannot gain extra points beyond the `50 ms` and `10,000 device` baselines.
+- Windows where the publisher did not hit the theoretical count are tracked separately as **publisher mismatch windows** and affect the Publish Attainment score.
 
 ---
 

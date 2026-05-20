@@ -113,16 +113,120 @@ public sealed class ContractTests
     }
 
     [Fact]
-    public void ScoreMathRewardsLowerIntervalsAgainstFiftyMillisecondBaseline()
+    public void ScoreMathIntervalScoreIsMaxAtFiftyMs()
     {
-        Assert.Equal(1d, ScoreMath.CalculateIntervalChallenge(50));
-        Assert.Equal(0.2d, ScoreMath.CalculateIntervalChallenge(250), 6);
+        Assert.Equal(1000d, ScoreMath.CalculateIntervalScore(50));
     }
 
     [Fact]
-    public void ScoreMathRewardsMoreDevicesAgainstTenThousandBaseline()
+    public void ScoreMathIntervalScoreIsZeroAtThousandMs()
     {
-        Assert.Equal(1d, ScoreMath.CalculateDeviceChallenge(10_000));
-        Assert.Equal(0.01d, ScoreMath.CalculateDeviceChallenge(100), 6);
+        Assert.Equal(0d, ScoreMath.CalculateIntervalScore(1000));
+    }
+
+    [Fact]
+    public void ScoreMathIntervalScoreIsClampedToBoundsOutsideRange()
+    {
+        // better than best → clamped to 1000
+        Assert.Equal(1000d, ScoreMath.CalculateIntervalScore(25));
+        // worse than worst → clamped to 0
+        Assert.Equal(0d, ScoreMath.CalculateIntervalScore(2000));
+    }
+
+    [Fact]
+    public void ScoreMathIntervalScoreIsLinear()
+    {
+        // 250 ms → 1000 × (1000 − 250) / (1000 − 50) = 789.47…
+        Assert.InRange(ScoreMath.CalculateIntervalScore(250), 789d, 790d);
+    }
+
+    [Fact]
+    public void ScoreMathDeviceScoreIsMaxAtFiftyThousandDevices()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculateDeviceScore(50_000));
+    }
+
+    [Fact]
+    public void ScoreMathDeviceScoreIsExactForFewDevices()
+    {
+        // 3 devices → 1000 × 3 / 50 000 = 0.06 pts
+        Assert.Equal(0.06d, ScoreMath.CalculateDeviceScore(3), 6);
+    }
+
+    [Fact]
+    public void ScoreMathDeviceScoreIsLinear()
+    {
+        // 25 000 devices → 500 pts
+        Assert.InRange(ScoreMath.CalculateDeviceScore(25_000), 499d, 501d);
+    }
+
+    [Fact]
+    public void ScoreMathDeviceScoreIsClampedAboveMaxDeviceCount()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculateDeviceScore(100_000));
+    }
+
+    [Fact]
+    public void ScoreMathLatencyScoreIsMaxAtHundredMs()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculateLatencyScore(100));
+    }
+
+    [Fact]
+    public void ScoreMathLatencyScoreIsZeroAtThousandMs()
+    {
+        Assert.Equal(0d, ScoreMath.CalculateLatencyScore(1000));
+    }
+
+    [Fact]
+    public void ScoreMathLatencyScoreIsZeroWhenNoDataYet()
+    {
+        Assert.Equal(0d, ScoreMath.CalculateLatencyScore(0));
+    }
+
+    [Fact]
+    public void ScoreMathLatencyScoreIsClampedToBoundsOutsideRange()
+    {
+        // better than best (< 100 ms) → clamped to 1000
+        Assert.Equal(1000d, ScoreMath.CalculateLatencyScore(50));
+        // worse than worst → clamped to 0
+        Assert.Equal(0d, ScoreMath.CalculateLatencyScore(2000));
+    }
+
+    [Fact]
+    public void ScoreMathLatencyScoreIsLinear()
+    {
+        // 550 ms → 1000 × (1000 − 550) / (1000 − 100) = 500 pts
+        Assert.InRange(ScoreMath.CalculateLatencyScore(550), 499d, 501d);
+    }
+
+    [Fact]
+    public void ScoreMathPublishAttainmentScoreScalesLinearly()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculatePublishAttainmentScore(1.0));
+        Assert.Equal(0d, ScoreMath.CalculatePublishAttainmentScore(0.0));
+        Assert.InRange(ScoreMath.CalculatePublishAttainmentScore(0.5), 499d, 501d);
+    }
+
+    [Fact]
+    public void ScoreMathPublishAttainmentScoreIsClamped()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculatePublishAttainmentScore(1.5));
+        Assert.Equal(0d, ScoreMath.CalculatePublishAttainmentScore(-0.1));
+    }
+
+    [Fact]
+    public void ScoreMathWindowCorrectnessScoreScalesLinearly()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculateWindowCorrectnessScore(1.0));
+        Assert.Equal(0d, ScoreMath.CalculateWindowCorrectnessScore(0.0));
+        Assert.InRange(ScoreMath.CalculateWindowCorrectnessScore(0.5), 499d, 501d);
+    }
+
+    [Fact]
+    public void ScoreMathWindowCorrectnessScoreIsClamped()
+    {
+        Assert.Equal(1000d, ScoreMath.CalculateWindowCorrectnessScore(1.5));
+        Assert.Equal(0d, ScoreMath.CalculateWindowCorrectnessScore(-0.1));
     }
 }

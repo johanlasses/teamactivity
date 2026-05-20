@@ -217,7 +217,12 @@ internal sealed record ScoreSnapshot(
     int PublisherMismatchWindowCount,
     double WindowCorrectness,
     double WindowInvalidRate,
-    double WindowMissingRate);
+    double WindowMissingRate,
+    double IntervalScore,
+    double DeviceScore,
+    double PublishAttainmentScore,
+    double WindowCorrectnessScore,
+    double LatencyScore);
 
 internal sealed record ChaosState(
     bool Enabled,
@@ -578,6 +583,53 @@ internal static class ScoreboardPage
       margin-bottom: 20px;
     }
 
+    /* ── Score breakdown bars ────────────────────────────────── */
+    .score-breakdown {
+      padding: 16px 12px;
+      background: var(--soft);
+      display: grid;
+      grid-template-columns: 160px 1fr 52px;
+      row-gap: 10px;
+      column-gap: 12px;
+      align-items: center;
+    }
+    .bar-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      white-space: nowrap;
+    }
+    .bar-track {
+      height: 14px;
+      background: #e5e7eb;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width .6s ease;
+    }
+    .bar-value {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--body);
+      text-align: right;
+      white-space: nowrap;
+    }
+    .expand-row { cursor: pointer; user-select: none; }
+    .expand-row:hover td { background: #f0f0f0; }
+    .expand-indicator {
+      display: inline-block;
+      font-size: 10px;
+      margin-right: 6px;
+      color: var(--muted);
+      transition: transform .2s;
+    }
+    .expand-indicator.open { transform: rotate(90deg); }
+
     /* ── Footer ──────────────────────────────────────────────── */
     footer {
       background: var(--surface);
@@ -873,15 +925,18 @@ internal static class ScoreboardPage
 
       if (chaosResult.status === 'fulfilled') updateChaosBanner(chaosResult.value);
 
+      let activeRunId = null;
       if (statusResult.status === 'fulfilled' && statusResult.value) {
         const s = statusResult.value;
         updateRunStatusBadge(s.status);
         if (s.status === 'Running' && s.startedAtUtc && s.config?.runWindowSeconds) {
           if (!runStartedAt) startTimer(s.startedAtUtc, s.config.runWindowSeconds);
+          activeRunId = s.config.runId ?? null;
         } else if (s.status === 'Idle') {
           stopTimer();
         }
       }
+      syncActiveRun(activeRunId);
 
         if (scoresResult.status === 'fulfilled') {
           const scores = scoresResult.value;
@@ -889,23 +944,30 @@ internal static class ScoreboardPage
           if (!scores.length) {
           scoresBody.innerHTML = '<tr><td colspan="12" class="td-muted" style="padding:20px 12px">No scores yet.</td></tr>';
         } else {
-          scoresBody.innerHTML = scores.map((score, i) => {
+          scoresBody.innerHTML = scores.flatMap((score, i) => {
             const rank = i + 1;
             const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : `${rank}. `;
-            return `<tr>
-              <td class="td-name" title="${esc(score.runId)}">${medal}${esc(score.name || score.runId)}</td>
-              <td>${esc(score.teamId)}</td>
-              <td class="td-score">${score.score.toFixed(2)}</td>
-              <td>${score.correct}</td>
-              <td class="${score.invalid ? 'td-bad' : ''}">${score.invalid}</td>
-              <td class="${score.missing ? 'td-bad' : ''}">${score.missing}</td>
-              <td>${score.latencyP95Ms.toFixed(0)}</td>
-              <td>${pct(score.publishAttainment)}</td>
-              <td class="${score.publisherMismatchWindowCount ? 'td-bad' : ''}">${score.publisherMismatchWindowCount}</td>
-              <td>${score.deviceCount ?? '—'}</td>
-              <td>${score.messageIntervalMs ?? '—'}</td>
-              <td>${score.runWindowSeconds ?? '—'}</td>
-            </tr>`;
+            const key = scoreKey(score);
+            const open = isScoreExpanded(score, activeRunId);
+            return [
+              `<tr class="expand-row" onclick="toggleScore(this,'${esc(key)}')" data-key="${esc(key)}">
+                <td class="td-name" title="${esc(score.runId)}"><span class="expand-indicator${open?' open':''}">▶</span>${medal}${esc(score.name || score.runId)}</td>
+                <td>${esc(score.teamId)}</td>
+                <td class="td-score">${score.score.toFixed(0)} <span style="font-weight:400;color:var(--muted);font-size:12px">/ 5000</span></td>
+                <td>${score.correct}</td>
+                <td class="${score.invalid ? 'td-bad' : ''}">${score.invalid}</td>
+                <td class="${score.missing ? 'td-bad' : ''}">${score.missing}</td>
+                <td>${score.latencyP95Ms.toFixed(0)}</td>
+                <td>${pct(score.publishAttainment)}</td>
+                <td class="${score.publisherMismatchWindowCount ? 'td-bad' : ''}">${score.publisherMismatchWindowCount}</td>
+                <td>${score.deviceCount ?? '—'}</td>
+                <td>${score.messageIntervalMs ?? '—'}</td>
+                <td>${score.runWindowSeconds ?? '—'}</td>
+              </tr>`,
+              `<tr class="score-detail-row" id="detail-score-${esc(key)}" style="display:${open?'':'none'}">
+                <td colspan="12" style="padding:0">${renderBars(score)}</td>
+              </tr>`
+            ];
           }).join('');
         }
       }
@@ -931,6 +993,69 @@ internal static class ScoreboardPage
           </tr>`).join('');
         }
       }
+    }
+
+    // ── Expand / collapse helpers ──────────────────────────────
+    const expandedScoreKeys = new Set();
+    let lastActiveRunId = null;
+
+    function scoreKey(score) { return score.runId + '|' + score.teamId; }
+
+    function getExpandedKeys(ns) {
+      return ns === 'score' ? expandedScoreKeys : new Set();
+    }
+
+    function syncActiveRun(activeRunId) {
+      if (activeRunId && activeRunId !== lastActiveRunId) {
+        // new run started — auto-expand its rows
+        expandedScoreKeys.add(activeRunId + '|*');
+        lastActiveRunId = activeRunId;
+      }
+      if (!activeRunId && lastActiveRunId) {
+        lastActiveRunId = null;
+      }
+    }
+
+    function isScoreExpanded(score, activeRunId) {
+      const key = scoreKey(score);
+      if (expandedScoreKeys.has(key)) return true;
+      // auto-expand all rows for the active runId
+      if (activeRunId && score.runId === activeRunId) return true;
+      return false;
+    }
+
+    function toggleScore(row, key) {
+      const detailRow = document.getElementById('detail-score-' + key);
+      const indicator = row.querySelector('.expand-indicator');
+      if (!detailRow) return;
+      const opening = detailRow.style.display === 'none';
+      detailRow.style.display = opening ? '' : 'none';
+      if (indicator) indicator.classList.toggle('open', opening);
+      if (opening) expandedScoreKeys.add(key); else expandedScoreKeys.delete(key);
+    }
+
+    function barColor(value) {
+      // 0 = red (hsl 0), 1000 = green (hsl 120)
+      const hue = Math.round(value * 0.12);
+      return `hsl(${hue},72%,40%)`;
+    }
+
+    function renderBars(score) {
+      const cats = [
+        { label: 'Interval', value: score.intervalScore },
+        { label: 'Devices', value: score.deviceScore },
+        { label: 'Publish Attainment', value: score.publishAttainmentScore },
+        { label: 'Window Correctness', value: score.windowCorrectnessScore },
+        { label: 'Latency P95', value: score.latencyScore },
+      ];
+      const rows = cats.map(c => {
+        const v = Math.max(0, Math.min(1000, c.value || 0));
+        const pct = (v / 10).toFixed(1);
+        return `<div class="bar-label">${c.label}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${barColor(v)}"></div></div>
+          <div class="bar-value">${v.toFixed(0)}</div>`;
+      }).join('');
+      return `<div class="score-breakdown">${rows}</div>`;
     }
 
     function pct(value) {
