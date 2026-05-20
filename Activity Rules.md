@@ -221,8 +221,32 @@ The maximum score is **5000 points**, made up of five categories worth **1000 po
 
 ### Category formulas
 
-- **Interval score** `= max(0, min(1000, 1000 × (1000 − intervalMs) / 950))`
-- **Devices score** `= max(0, min(1000, 1000 × deviceCount / 50 000))`
+- **Interval score** — piecewise linear, steep at low latency, flattening toward 1000 ms:
+
+  | Interval | Score |
+  |---|---|
+  | ≤ 50 ms | 1000 |
+  | 100 ms | 800 |
+  | 250 ms | 500 |
+  | 500 ms | 250 |
+  | 750 ms | 100 |
+  | ≥ 1000 ms | 0 |
+
+  Values between anchors are linearly interpolated.
+
+- **Devices score** — log-linear from 1 to 10 000 devices, then linear to 50 000:
+
+  | Devices | Score |
+  |---|---|
+  | 10 | 50 |
+  | 100 | 100 |
+  | 1 000 | 200 |
+  | 10 000 | 500 |
+  | 50 000 | 1000 |
+
+  Below 10 000 devices: interpolated on a log₁₀ scale between the anchors above.
+  From 10 000 to 50 000 devices: linearly interpolated.
+
 - **Publish Attainment score** `= max(0, min(1000, 1000 × publishAttainment))`
 - **Window Correctness score** `= max(0, min(1000, 1000 × windowCorrectness))`
 - **Latency score** `= max(0, min(1000, 1000 × (1000 − latencyP95ms) / 900))` _(0 if no data yet)_

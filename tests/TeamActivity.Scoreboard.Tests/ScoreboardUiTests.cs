@@ -167,13 +167,13 @@ public sealed class ScoreboardUiTests : IAsyncLifetime
         Assert.True(barValues.Length == 5,
             $"Expected 5 score breakdown bars but got {barValues.Length}. Values: [{string.Join(", ", barValues)}]");
 
-        // Interval bar: 250 ms → 1000 × (1000 − 250) / (1000 − 50) ≈ 789 pts (fixed at run start)
+        // Interval bar: 250 ms → anchor point → exactly 500 pts (fixed at run start)
         var intervalBarScore = int.Parse(barValues[0]);
-        Assert.InRange(intervalBarScore, 788, 791);
+        Assert.InRange(intervalBarScore, 499, 501);
 
-        // Device bar: 3 devices → 1000 × 3 / 50 000 ≈ 0 pts (fixed at run start)
+        // Device bar: 3 devices → log10(3) × 50 ≈ 23.86 pts → rounds to ~24 (fixed at run start)
         var deviceBarScore = int.Parse(barValues[1]);
-        Assert.InRange(deviceBarScore, 0, 1);
+        Assert.InRange(deviceBarScore, 22, 26);
     }
 
     // ── Scenario 2: Chaos enabled ─────────────────────────────────────────────

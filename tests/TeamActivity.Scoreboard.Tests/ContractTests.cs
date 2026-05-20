@@ -134,10 +134,24 @@ public sealed class ContractTests
     }
 
     [Fact]
-    public void ScoreMathIntervalScoreIsLinear()
+    public void ScoreMathIntervalScoreHitsAllAnchorPoints()
     {
-        // 250 ms → 1000 × (1000 − 250) / (1000 − 50) = 789.47…
-        Assert.InRange(ScoreMath.CalculateIntervalScore(250), 789d, 790d);
+        // Piecewise-linear anchors defined by the scoring spec
+        Assert.Equal(1000d, ScoreMath.CalculateIntervalScore(50));
+        Assert.Equal(800d,  ScoreMath.CalculateIntervalScore(100));
+        Assert.Equal(500d,  ScoreMath.CalculateIntervalScore(250));
+        Assert.Equal(250d,  ScoreMath.CalculateIntervalScore(500));
+        Assert.Equal(100d,  ScoreMath.CalculateIntervalScore(750));
+        Assert.Equal(0d,    ScoreMath.CalculateIntervalScore(1000));
+    }
+
+    [Fact]
+    public void ScoreMathIntervalScoreInterpolatesBetweenAnchors()
+    {
+        // Midpoint of (50,1000)→(100,800) segment: 75 ms → 900
+        Assert.InRange(ScoreMath.CalculateIntervalScore(75), 899d, 901d);
+        // Midpoint of (250,500)→(500,250) segment: 375 ms → 375
+        Assert.InRange(ScoreMath.CalculateIntervalScore(375), 374d, 376d);
     }
 
     [Fact]
@@ -147,17 +161,21 @@ public sealed class ContractTests
     }
 
     [Fact]
-    public void ScoreMathDeviceScoreIsExactForFewDevices()
+    public void ScoreMathDeviceScoreHitsAllAnchorPoints()
     {
-        // 3 devices → 1000 × 3 / 50 000 = 0.06 pts
-        Assert.Equal(0.06d, ScoreMath.CalculateDeviceScore(3), 6);
+        // Log-linear anchors defined by the scoring spec
+        Assert.InRange(ScoreMath.CalculateDeviceScore(10),     49d, 51d);
+        Assert.InRange(ScoreMath.CalculateDeviceScore(100),    99d, 101d);
+        Assert.InRange(ScoreMath.CalculateDeviceScore(1_000),  199d, 201d);
+        Assert.InRange(ScoreMath.CalculateDeviceScore(10_000), 499d, 501d);
+        Assert.Equal(1000d, ScoreMath.CalculateDeviceScore(50_000));
     }
 
     [Fact]
-    public void ScoreMathDeviceScoreIsLinear()
+    public void ScoreMathDeviceScoreLinearSegmentAboveTenThousand()
     {
-        // 25 000 devices → 500 pts
-        Assert.InRange(ScoreMath.CalculateDeviceScore(25_000), 499d, 501d);
+        // Midpoint of linear segment (10 000→50 000): 30 000 → 750
+        Assert.InRange(ScoreMath.CalculateDeviceScore(30_000), 749d, 751d);
     }
 
     [Fact]
