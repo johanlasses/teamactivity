@@ -18,7 +18,6 @@ public sealed class Worker(
 
     private readonly object gate = new();
     private readonly Dictionary<WindowKey, AggregateWindow> windows = [];
-    private readonly HashSet<string> seenTelemetry = [];
     private readonly HashSet<WindowKey> publishedWindows = [];
     private string? currentRunId;
 
@@ -88,7 +87,6 @@ public sealed class Worker(
             return;
         }
 
-        var dedupeKey = WindowMath.TelemetryDedupeKey(telemetry);
         var windowKey = WindowMath.Assign(telemetry, challenge.WindowSeconds);
 
         lock (gate)
@@ -98,16 +96,10 @@ public sealed class Worker(
             {
                 logger.LogInformation("New runId detected ({NewRunId}), clearing window state from previous run.", telemetry.RunId);
                 windows.Clear();
-                seenTelemetry.Clear();
                 publishedWindows.Clear();
             }
 
             currentRunId = telemetry.RunId;
-
-            if (!seenTelemetry.Add(dedupeKey))
-            {
-                return;
-            }
 
             if (!windows.TryGetValue(windowKey, out var aggregate))
             {

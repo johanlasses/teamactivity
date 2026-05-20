@@ -671,11 +671,9 @@ internal static class ScoreboardPage
         <input type="password" id="organizer-key-input" placeholder="X-Organizer-Key (optional)" oninput="saveOrganizerKey(this.value)" style="padding:6px 10px;border:1px solid #d1d5db;border-radius:2px;font-size:13px;width:220px">
       </div>
       <div class="organizer-row">
-        <button class="chaos-btn" onclick="fireChaosEvent('processor-restart','Processor service restarted')">🔄 Processor Restart</button>
-        <button class="chaos-btn" onclick="fireChaosEvent('message-burst','Publisher briefly sending at a much faster rate')">💥 Message Burst</button>
-        <button class="chaos-btn" onclick="fireChaosEvent('message-gap','Publisher paused for several seconds')">⏸ Message Gap</button>
-        <button class="chaos-btn" onclick="fireChaosEvent('device-dropout','One device stopped sending')">📵 Device Dropout</button>
-        <button class="chaos-btn" onclick="fireChaosEvent('high-latency','Artificial delay injected between publisher and broker')">🐢 High Latency</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('message-duplications','Duplicate messages injected')">💥 Message Duplications</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('publisher-disconnect','Forcing publisher to reconnect')">🔌 Publisher Disconnect</button>
+        <button class="chaos-btn" onclick="fireChaosEvent('processor-disconnect','Forcing processor to reconnect')">🔌 Processor Disconnect</button>
         <button id="end-event-btn" onclick="endChaosEvent()">🧹 Clear Chaos</button>
       </div>
       <div id="chaos-feedback"></div>

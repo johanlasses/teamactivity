@@ -4,11 +4,9 @@ public sealed class ChaosStore
 {
     public static readonly IReadOnlySet<string> AllowedEventTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "processor-restart",
-        "message-burst",
-        "message-gap",
-        "device-dropout",
-        "high-latency"
+        "message-duplications",
+        "publisher-disconnect",
+        "processor-disconnect"
     };
 
     private readonly object gate = new();

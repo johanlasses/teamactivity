@@ -1,3 +1,6 @@
+using MQTTnet;
+using TeamActivity.Shared.Contracts;
+
 namespace TeamActivity.Judge;
 
 public sealed record ChaosScheduleEntry(
@@ -10,16 +13,12 @@ public static class ChaosSchedule
 {
     public static readonly IReadOnlyList<ChaosScheduleEntry> DefaultSchedule =
     [
-        new(15,  "start", "message-burst",      "High-frequency message burst"),
-        new(35,  "end",   null,                 null),
-        new(40,  "start", "device-dropout",     "Device stopped transmitting"),
-        new(60,  "end",   null,                 null),
-        new(65,  "start", "message-gap",        "Publisher paused — simulated connectivity loss"),
-        new(80,  "end",   null,                 null),
-        new(85,  "start", "high-latency",       "Network congestion injected"),
-        new(100, "end",   null,                 null),
-        new(105, "start", "processor-restart",  "Processor service restarted"),
-        new(115, "end",   null,                 null),
+        new(20,  "start", "message-duplications",  "Duplicate messages injected"),
+        new(30,  "end",   null,                     null),
+        new(60,  "start", "publisher-disconnect",   "Forcing publisher to reconnect"),
+        new(65,  "end",   null,                     null),
+        new(90,  "start", "processor-disconnect",   "Forcing processor to reconnect"),
+        new(95,  "end",   null,                     null),
     ];
 
     public static async Task RunAsync(
@@ -27,6 +26,10 @@ public static class ChaosSchedule
         ILogger logger,
         DateTimeOffset startedAtUtc,
         IEnumerable<ChaosScheduleEntry> schedule,
+        ChaosMessageBuffer buffer,
+        RunAnnouncer announcer,
+        MqttOptions mqttOptions,
+        string teamId,
         CancellationToken cancellationToken)
     {
         foreach (var entry in schedule.OrderBy(e => e.OffsetSeconds))
@@ -47,6 +50,8 @@ public static class ChaosSchedule
                 logger.LogInformation(
                     "Chaos event started: Type={EventType} Description={Description}",
                     entry.EventType, entry.Description);
+
+                await ExecuteEventActionAsync(entry.EventType, buffer, announcer, mqttOptions, teamId, logger, cancellationToken);
             }
             else if (entry.Action == "end")
             {
@@ -60,6 +65,89 @@ public static class ChaosSchedule
                         ending.Type, duration.TotalSeconds);
                 }
             }
+        }
+    }
+
+    public static Task ExecuteManualEventActionAsync(
+        string eventType,
+        ChaosMessageBuffer buffer,
+        RunAnnouncer announcer,
+        MqttOptions mqttOptions,
+        string teamId,
+        ILogger logger) =>
+        ExecuteEventActionAsync(eventType, buffer, announcer, mqttOptions, teamId, logger, CancellationToken.None);
+
+    private static async Task ExecuteEventActionAsync(
+        string eventType,
+        ChaosMessageBuffer buffer,
+        RunAnnouncer announcer,
+        MqttOptions mqttOptions,
+        string teamId,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        switch (eventType)
+        {
+            case "message-duplications":
+                await RunMessageBurstAsync(buffer, announcer, logger, cancellationToken);
+                break;
+
+            case "publisher-disconnect":
+                await DisconnectClientAsync($"publisher-{teamId}", mqttOptions, logger, cancellationToken);
+                break;
+
+            case "processor-disconnect":
+                await DisconnectClientAsync($"processor-{teamId}", mqttOptions, logger, cancellationToken);
+                break;
+        }
+    }
+
+    private static async Task RunMessageBurstAsync(
+        ChaosMessageBuffer buffer,
+        RunAnnouncer announcer,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        var messages = buffer.GetRecent(TimeSpan.FromSeconds(3));
+        if (messages.Count == 0)
+        {
+            logger.LogWarning("Chaos message-duplications: no recent messages in buffer, skipping replay");
+            return;
+        }
+
+        logger.LogInformation("Chaos message-duplications: replaying {Count} recent messages", messages.Count);
+        foreach (var (topic, payload) in messages)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            announcer.Announce(topic, payload);
+            await Task.Delay(5, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task DisconnectClientAsync(
+        string clientId,
+        MqttOptions mqttOptions,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var factory = new MqttClientFactory();
+            using var impersonator = factory.CreateMqttClient();
+            var options = new MqttClientOptionsBuilder()
+                .WithClientId(clientId)
+                .WithTcpServer(mqttOptions.Host, mqttOptions.Port)
+                .WithCleanStart()
+                .Build();
+
+            // Connecting with the same client ID forces the broker to disconnect the real client
+            await impersonator.ConnectAsync(options, cancellationToken);
+            await impersonator.DisconnectAsync(cancellationToken: cancellationToken);
+            logger.LogInformation("Chaos disconnect: evicted client {ClientId}", clientId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Chaos disconnect failed for client {ClientId}", clientId);
         }
     }
 }

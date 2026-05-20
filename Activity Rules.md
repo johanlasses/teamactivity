@@ -359,7 +359,7 @@ The organiser can fire specific chaos events during the run via the Judge chaos 
 | Type | What happens | What your Processor must handle |
 |---|---|---|
 | `processor-restart` | Your Processor service is killed and restarts mid-run | Reconnect to MQTT, recover in-progress window state, resume publishing results |
-| `message-burst` | Publisher briefly sends at a much faster rate | Dedup by `sequence`, avoid double-counting, handle backpressure |
+| `message-duplications` | Duplicate messages injected | Dedup by `sequence`, avoid double-counting, handle backpressure |
 | `message-gap` | Publisher pauses sending for several seconds | Keep open windows alive; do not close/discard windows prematurely |
 | `device-dropout` | One device stops sending for a period | Finalise that device's windows with the data you have; don't block other devices |
 | `high-latency` | Artificial delay injected between publisher and broker | Tighten your latency margin; publish results before the 2-second grace period expires |

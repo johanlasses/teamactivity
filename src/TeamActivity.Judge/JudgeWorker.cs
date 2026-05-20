@@ -18,6 +18,7 @@ public sealed class JudgeWorker(
     RunTriggerStore runTriggers,
     ChaosScheduleTracker scheduleTracker,
     ChaosStore chaosStore,
+    ChaosMessageBuffer chaosBuffer,
     RunAnnouncer announcer) : BackgroundService
 {
     private static readonly Counter<long> RawReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_raw_received_total");
@@ -134,6 +135,7 @@ public sealed class JudgeWorker(
 
             if (telemetry is not null && error is null)
             {
+                chaosBuffer.Add(topic, payload);
                 scoring.ObserveTelemetry(telemetry, challengeOptions.Value.WindowSeconds);
                 RawReceived.Add(1, new KeyValuePair<string, object?>("team_id", telemetry.TeamId));
             }
@@ -181,7 +183,7 @@ public sealed class JudgeWorker(
                         {
                             var cts = new CancellationTokenSource();
                             scheduleTracker.Register(control.RunId, cts);
-                            _ = ChaosSchedule.RunAsync(chaosStore, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+                            _ = ChaosSchedule.RunAsync(chaosStore, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, chaosBuffer, announcer, mqttOptions.Value, control.TeamId, cts.Token);
                         }
                     }
                     logger.LogInformation(

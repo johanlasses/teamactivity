@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Options;
 using TeamActivity.Judge;
 using TeamActivity.Shared.Contracts;
 
@@ -9,6 +10,7 @@ builder.Services.Configure<ChallengeOptions>(builder.Configuration.GetSection("C
 builder.Services.AddSingleton<ObservedRunStore>();
 builder.Services.AddSingleton<ScoringStore>();
 builder.Services.AddSingleton<ChaosStore>();
+builder.Services.AddSingleton<ChaosMessageBuffer>();
 builder.Services.AddSingleton<RunTriggerStore>();
 builder.Services.AddSingleton<ChaosScheduleTracker>();
 builder.Services.AddSingleton<RunAnnouncer>();
@@ -37,7 +39,7 @@ app.MapGet("/api/run/pending", (RunTriggerStore triggers) =>
 
 app.MapGet("/api/chaos/schedule", () => Results.Ok(ChaosSchedule.DefaultSchedule));
 
-app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker, ILogger<Program> logger) =>
+app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker, ChaosMessageBuffer chaosBuffer, RunAnnouncer announcer, IOptions<MqttOptions> mqttOptions, ILogger<Program> logger) =>
 {
     if (!triggers.TryAcknowledge(req.RunId))
         return Results.Conflict("Run acknowledgement failed — state may have changed.");
@@ -48,7 +50,7 @@ app.MapPost("/api/run/acknowledge", (AcknowledgeRunRequest req, RunTriggerStore 
     {
         var cts = new CancellationTokenSource();
         scheduleTracker.Register(req.RunId, cts);
-        _ = ChaosSchedule.RunAsync(chaos, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, cts.Token);
+        _ = ChaosSchedule.RunAsync(chaos, logger, status.StartedAtUtc.Value, ChaosSchedule.DefaultSchedule, chaosBuffer, announcer, mqttOptions.Value, string.Empty, cts.Token);
     }
 
     return Results.Ok();
@@ -120,7 +122,7 @@ app.MapPost("/api/chaos/disable", (ChaosStore chaos, ILogger<Program> logger, Ht
     return Results.Ok(chaos.GetState());
 });
 
-app.MapPost("/api/chaos/event/start", (ChaosEventStartRequest req, ChaosStore chaos, ILogger<Program> logger, HttpContext ctx) =>
+app.MapPost("/api/chaos/event/start", async (ChaosEventStartRequest req, ChaosStore chaos, ChaosMessageBuffer chaosBuffer, RunAnnouncer announcer, IOptions<MqttOptions> mqttOptions, IOptions<ChallengeOptions> challengeOptions, ILogger<Program> logger, HttpContext ctx) =>
 {
     if (!IsAuthorized(ctx, organizerKey)) return Results.Unauthorized();
     if (!ChaosStore.AllowedEventTypes.Contains(req.Type))
@@ -129,7 +131,8 @@ app.MapPost("/api/chaos/event/start", (ChaosEventStartRequest req, ChaosStore ch
             $"Unknown event type '{req.Type}'. Allowed: {string.Join(", ", ChaosStore.AllowedEventTypes)}");
     }
     chaos.StartEvent(req.Type, req.Description ?? string.Empty);
-    logger.LogInformation("Chaos event started: Type={EventType} Description={Description}", req.Type, req.Description);
+    logger.LogInformation("Chaos event started (manual): Type={EventType} Description={Description}", req.Type, req.Description);
+    _ = ChaosSchedule.ExecuteManualEventActionAsync(req.Type, chaosBuffer, announcer, mqttOptions.Value, challengeOptions.Value.TeamId, logger);
     return Results.Ok(chaos.GetState());
 });
 
