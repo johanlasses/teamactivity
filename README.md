@@ -13,13 +13,13 @@ This repository is the operator/developer reference for the **MQTT AI Battle** h
 ## Run
 
 ```bash
-aspire start --apphost TeamActivity.AppHost/TeamActivity.AppHost.csproj
+aspire start
 ```
 
 Open the Aspire dashboard URL printed in the terminal to inspect resource state, logs, traces, and metrics.
 
 ```bash
-aspire stop --apphost TeamActivity.AppHost/TeamActivity.AppHost.csproj
+aspire stop
 ```
 
 ## Guardrail tests
@@ -28,14 +28,6 @@ Validates the full pipeline end-to-end (build → run → score → Playwright U
 
 ```bash
 bash scripts/smoke-test.sh
-```
-
-With the stack already running:
-
-```bash
-bash scripts/install-playwright.sh
-RUN_SCOREBOARD_UI_TESTS=true SCOREBOARD_BASE_URL=http://localhost:5216 \
-  dotnet test tests/TeamActivity.Scoreboard.Tests/TeamActivity.Scoreboard.Tests.csproj
 ```
 
 ## Aspire MCP (agentic assistance)
