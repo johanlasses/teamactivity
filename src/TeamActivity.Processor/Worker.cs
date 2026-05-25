@@ -55,6 +55,10 @@ public sealed class Worker(
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
         logger.LogInformation("Processor subscribed to {Topic}", wildcardTopic);
 
+        // ── IMPROVEMENT OPPORTUNITY ───────────────────────────────────────────────
+        // The timer fires every 500 ms, but windows close every 5 seconds and the
+        // Judge's grace period is only 2 seconds after windowEnd. Publishing sooner
+        // (e.g. immediately when windowEnd passes) improves your latency score.
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
@@ -91,13 +95,17 @@ public sealed class Worker(
 
         lock (gate)
         {
-            // New run detected — reset all state so previous run's data doesn't bleed in.
+            // ── KEEP THIS ──────────────────────────────────────────────────────────
+            // Resets window state when a new run starts so previous run data doesn't
+            // bleed into the new run's aggregates. If you refactor state management,
+            // make sure this reset still happens when the runId changes.
             if (currentRunId is not null && currentRunId != telemetry.RunId)
             {
                 logger.LogInformation("New runId detected ({NewRunId}), clearing window state from previous run.", telemetry.RunId);
                 windows.Clear();
                 publishedWindows.Clear();
             }
+            // ───────────────────────────────────────────────────────────────────────
 
             currentRunId = telemetry.RunId;
 
@@ -108,6 +116,11 @@ public sealed class Worker(
             }
 
             aggregate.Add(telemetry.Value);
+            // ── IMPROVEMENT OPPORTUNITY ───────────────────────────────────────────
+            // The template does not deduplicate readings. During chaos mode, duplicate
+            // messages can be injected. Add dedup here by tracking seen sequences:
+            //   e.g. a HashSet<(string deviceId, long sequence)> per run.
+            // ──────────────────────────────────────────────────────────────────────
             TelemetryConsumed.Add(1, new KeyValuePair<string, object?>("team_id", telemetry.TeamId));
         }
     }

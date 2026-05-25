@@ -33,6 +33,10 @@ public sealed class Worker(
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
 
+        // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
+        // The Scoreboard sends a RunTriggerMessage over MQTT to kick off each run.
+        // This channel receives it and routes it to ExecuteRun. Without this, the
+        // Scoreboard Start Run button will appear to hang indefinitely (Pending state).
         var triggerChannel = Channel.CreateBounded<RunTriggerMessage>(new BoundedChannelOptions(1)
         {
             FullMode = BoundedChannelFullMode.DropOldest
@@ -49,6 +53,7 @@ public sealed class Worker(
             }
             return Task.CompletedTask;
         };
+        // ─────────────────────────────────────────────────────────────────────────
 
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"publisher-{challenge.TeamId}")
@@ -107,10 +112,20 @@ public sealed class Worker(
         long publishedCount = 0;
         long sequence = 1;
 
+        // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
+        // Signals the Judge and Scoreboard that this team's Publisher has started.
+        // The Scoreboard transitions from Pending → Running on receipt of this message.
         await PublishControl(client, runId, challenge.TeamId, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs, runWindowSeconds);
+        // ─────────────────────────────────────────────────────────────────────────
 
         var telemetryTopic = Topics.TelemetryRaw(runId, challenge.TeamId);
 
+        // ── YOUR CODE ─────────────────────────────────────────────────────────────
+        // Improve this loop to maximise your score:
+        //   - Make timing more precise so the interval score stays high under load
+        //   - Tune the `value` formula (the Judge doesn't care what values you emit,
+        //     but consistency helps when debugging aggregate correctness)
+        //   - Parallelise per-device publishing if you want to push interval lower
         for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
         {
             var scheduledAtUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
@@ -149,9 +164,14 @@ public sealed class Worker(
                 TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
             }
         }
+        // ─────────────────────────────────────────────────────────────────────────
 
+        // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
+        // Signals the Judge and Scoreboard that this run is complete.
+        // The Scoreboard transitions from Running → Idle on receipt of this message.
         await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken,
             traceParent: activity?.Id);
+        // ─────────────────────────────────────────────────────────────────────────
     }
 
     private static Task PublishControl(

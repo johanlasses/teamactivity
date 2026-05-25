@@ -1,110 +1,170 @@
 # MQTT AI Battle — Activity Rules
 
-## Event Overview
+## What is this?
 
-Welcome to **MQTT AI Battle** — a hands-on team engineering challenge where you race to build the most accurate and low-latency MQTT telemetry pipeline.
+A 2-hour team engineering challenge. You improve a **.NET Aspire** telemetry pipeline — the team with the highest score wins.
 
-Each team starts from the same template project. A simulated Publisher fires sensor readings at high frequency across multiple virtual devices. Your job is to consume those readings, aggregate them into fixed-size time windows, and publish the results back over MQTT — fast and accurately. An impartial **Judge** service validates everything and keeps score in real time. The team with the highest score wins.
+A simulated **Publisher** fires sensor readings over MQTT. Your **Processor** consumes them, aggregates into 5-second windows, and publishes results back. An impartial **Judge** validates everything and keeps score in real time.
 
 ---
 
-## Template Project — Architecture
+## The competition
 
-The template is a **.NET Aspire** solution. Aspire orchestrates all services and provides a built-in observability dashboard.
+When the 2 hours have passed we meet up and each team will run their solution with their choice of devices and interval.
+
+- 2 minute run without chaos mode enabled
+- 2 minute run **with** chaos mode enabled
+
+Team with the most points will win. We will crown a non-chaos and chaos champion. 
+
+---
+
+
+## Your Task
+
+Improve the **Publisher** and **Processor** to maximise your score. The template works end-to-end but is deliberately basic.
+
+**What to improve:**
+- Correct aggregate calculations for all devices and windows
+- Publish results close to `windowEnd` (low latency)
+- Handle MQTT reconnects and ensure no windows are dropped
+
+**Do not modify:**
+- `src/TeamActivity.Judge`
+- `src/TeamActivity.Scoreboard`
+- `src/TeamActivity.Shared.Contracts`
+- `TeamActivity.AppHost`
+- `scripts/`
+
+Keep all MQTT topic patterns and JSON field names exactly as defined — any deviation results in `Invalid` or unscored messages.
+
+---
+
+## Scoring
+
+**Maximum: 5000 points** — five categories, 1000 pts each.
+
+| Category | 1000 pts (best) | 0 pts (worst) | When |
+|---|---|---|---|
+| **Interval** | 50 ms | 1000 ms | Fixed at run start |
+| **Devices** | 50 000 devices | 1 device | Fixed at run start |
+| **Publish Attainment** | 100% windows published | 0% published | Live |
+| **Window Correctness** | 100% correct | 0% correct | Live |
+| **Latency** | 100 ms P95 | ≥ 1000 ms P95 | Live |
+
+**Interval** and **Devices** scores are locked in when you start the run. The other three depend entirely on your Processor.
+
+> **Window scoring note:** The Judge only scores "fully observed" windows — where the actual broker message count matches the theoretical count. Missed Publisher messages reduce your Publish Attainment score.
+
+---
+
+## Starting a Run
+
+Open the **Scoreboard** in your browser after starting Aspire — runs do **not** start automatically.
+
+| Control | Default | Description |
+|---|---|---|
+| **Device Count** | `3` | Number of simulated devices. Higher = more load and more potential score. |
+| **Message Interval (ms)** | `250` | Delay between messages per device. Lower = higher message rate. |
+| **Run Window (seconds)** | `120` | Duration of the run. |
+| **Enable Chaos Mode** | unchecked | Arms chaos disruptions for the run. |
+
+Click **▶ Start Run**. The status badge goes: **Idle → Pending → Running → Idle**.
+
+The `runId` is auto-generated as a movie character name for each run.
+
+---
+
+## Chaos Mode
+
+Start a run with **Enable Chaos Mode** checked. The Scoreboard shows an amber banner when chaos is armed, and a red pulsing banner when an event fires. You know what can happen — not when.
+
+| Event | What happens | What to handle |
+|---|---|---|
+| `processor-disconnect` | Your Processor is killed mid-run | Reconnect to MQTT, recover in-progress window state |
+| `publisher-disconnect` | Your Publisher is killed mid-run | Reconnect to MQTT, recover in-progress window state |
+| `message-duplications` | Duplicate messages injected | Deduplicate by `sequence` |
+
+---
+## Architecture
 
 ```
-Publisher ──► MQTT broker (Mosquitto) ──► Processor ──► MQTT broker ──► Judge
-                                                                        │
-                                                             Scoreboard ◄─ HTTP /api/scores
+Publisher ──► MQTT broker ──► Processor ──► MQTT broker ──► Judge
+                                                            │
+                                               Scoreboard ◄─ HTTP /api/scores
 ```
 
 | Service | Role |
 |---|---|
-| **Mosquitto** | MQTT broker — the message bus every service connects to (port 1883) |
-| **Publisher** | Simulates sensor devices; emits `TelemetryMessage` JSON and lifecycle `ControlMessage` JSON over MQTT |
-| **Processor** | **Your main work surface.** Subscribes to telemetry, aggregates readings into time windows, and publishes `AggregateResultMessage` JSON back to MQTT |
-| **Judge** | Impartial validator and scorer. Subscribes to all topics, computes expected aggregates independently, and scores each result window |
-| **Scoreboard** | ASP.NET Core web app that reads the Judge HTTP API and displays the live leaderboard |
-| **Aspire Dashboard** | Observability surface for logs, traces, and metrics via OpenTelemetry |
+| **Publisher** | Emits sensor readings and run lifecycle messages over MQTT |
+| **Processor** | ⭐ **Your main work surface.** Aggregates readings into windows, publishes results |
+| **Mosquitto** | MQTT broker — do not modify |
+| **Judge** | Validates and scores results — do not modify |
+| **Scoreboard** | Live leaderboard — do not modify |
+| **Aspire Dashboard** | Logs, traces, and metrics for your pipeline |
 
 ---
 
-## How to Run the Stack
+## Setup
 
-### Prerequisites
-
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (for the Mosquitto container)
-- [Aspire CLI](https://aspire.dev/get-started/install-cli/)
-
-### Start
+**Prerequisites:** [.NET 10 SDK](https://dotnet.microsoft.com/download) · [Docker Desktop](https://www.docker.com/products/docker-desktop/) · [Aspire CLI](https://aspire.dev/get-started/install-cli/)
 
 ```bash
-aspire start --apphost TeamActivity.AppHost/TeamActivity.AppHost.csproj
+git clone https://github.com/johanlasses/teamactivity.git
 ```
 
-The Aspire dashboard URL is printed in the terminal. Open it to view resource state, logs, traces, and metrics.
+**Set your team ID** in `src/TeamActivity.Publisher/appsettings.json` so your results appear on the Scoreboard:
 
-### Stop
-
-```bash
-aspire stop --apphost TeamActivity.AppHost/TeamActivity.AppHost.csproj
+```json
+"teamId": "your-team-name"
 ```
 
-> **Do not** leave orphaned `dotnet run` processes or containers running between sessions.
-
----
-
-## Running the Guardrail Tests
-
-A smoke-test script validates the full pipeline from start to score:
-
+**Start:**
 ```bash
-bash scripts/smoke-test.sh
+aspire start
 ```
+The Aspire dashboard URL is printed in the terminal. Open it to inspect logs, traces, and metrics.
 
-The script:
-1. Builds the solution
-2. Starts Aspire
-3. Triggers a short run via the Judge API
-4. Waits for the run to produce scored windows
-5. Checks the Judge API for at least one correct aggregate
-6. Installs the Playwright Chromium browser if needed
-7. Runs the Scoreboard Playwright UI tests
-8. Stops Aspire
-
-If the stack is already running you can run just the UI tests:
-
+**Stop:**
 ```bash
-bash scripts/install-playwright.sh
-RUN_SCOREBOARD_UI_TESTS=true SCOREBOARD_BASE_URL=http://localhost:5216 \
-  dotnet test tests/TeamActivity.Scoreboard.Tests/TeamActivity.Scoreboard.Tests.csproj
+aspire stop
 ```
 
 ---
 
-## MQTT Topic Contracts
-
-All topics follow a versioned hierarchy using `runId` and `teamId` to namespace each team's traffic.
+## Reference: MQTT Topics
 
 | Direction | Topic pattern | QoS |
 |---|---|---|
-| Publisher → broker | `telemetry/v1/{runId}/{teamId}/raw` | 0 (at most once) |
-| Publisher → broker | `control/v1/{runId}/{teamId}/publisher-start` | 1 (at least once) |
-| Publisher → broker | `control/v1/{runId}/{teamId}/publisher-complete` | 1 (at least once) |
-| Processor → broker | `results/v1/{runId}/{teamId}/device/{deviceId}/window/{windowStartUtcMs}` | 1 (at least once) |
+| Publisher → broker | `telemetry/v1/{runId}/{teamId}/raw` | 0 |
+| Publisher → broker | `control/v1/{runId}/{teamId}/publisher-start` | 1 |
+| Publisher → broker | `control/v1/{runId}/{teamId}/publisher-complete` | 1 |
+| Processor → broker | `results/v1/{runId}/{teamId}/device/{deviceId}/window/{windowStartUtcMs}` | 1 |
 
-`{windowStartUtcMs}` is the Unix timestamp in **milliseconds** of the window start (UTC).
+`{windowStartUtcMs}` is the window start as a Unix timestamp in **milliseconds** (UTC).
 
 ---
 
-## Message Schemas (JSON)
+## Reference: Windowing Rules
 
-All payloads are UTF-8 JSON. **`schemaVersion` must always be `2`.**
+Windows are **5-second, fixed, non-overlapping**, aligned to the Unix epoch.
 
-### TelemetryMessage
+```
+windowStart = floor(eventTimeUtc_unix_ms / 5000) × 5000
+windowEnd   = windowStart + 5000 ms
+```
 
-Published by the Publisher once per reading.
+- Each device has its own independent set of windows
+- Deduplicate readings by `runId|teamId|deviceId|sequence`
+- **Grace period: 2 seconds** — results arriving after `windowEnd + 2s` are scored `Invalid`
+
+---
+
+## Reference: Message Schemas
+
+All payloads are UTF-8 JSON with `"schemaVersion": 2`.
+
+### TelemetryMessage (published by Publisher)
 
 ```json
 {
@@ -119,20 +179,7 @@ Published by the Publisher once per reading.
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `schemaVersion` | int | Must be `2` |
-| `runId` | string | Identifies the run |
-| `teamId` | string | Identifies the team |
-| `deviceId` | string | Identifies the simulated device (e.g. `device-001`) |
-| `sequence` | long | Monotonically increasing per Publisher run |
-| `eventTimeUtc` | ISO 8601 | When the reading was taken — used for window assignment |
-| `publishedAtUtc` | ISO 8601 | When the message was published |
-| `value` | double | The sensor reading |
-
-### AggregateResultMessage
-
-Published by the Processor once per completed window, per device.
+### AggregateResultMessage (published by Processor)
 
 ```json
 {
@@ -152,25 +199,9 @@ Published by the Processor once per completed window, per device.
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `schemaVersion` | int | Must be `2` |
-| `runId` | string | Must match the telemetry |
-| `teamId` | string | Must match the telemetry |
-| `deviceId` | string | Must match the telemetry |
-| `windowStartUtc` | ISO 8601 | Start of the aggregation window (inclusive) |
-| `windowEndUtc` | ISO 8601 | End of the aggregation window (exclusive) |
-| `count` | int | Number of readings in the window |
-| `sum` | double | Sum of all `value` readings |
-| `min` | double | Minimum `value` |
-| `max` | double | Maximum `value` |
-| `avg` | double | Arithmetic mean (`sum / count`) |
-| `resultId` | string | Unique identifier for this result (format: `{teamId}-{deviceId}-{windowStartUtc:yyyyMMddTHHmmssfffZ}`) |
-| `publishedAtUtc` | ISO 8601 | When the result was published |
+`resultId` format: `{teamId}-{deviceId}-{windowStartUtc:yyyyMMddTHHmmssfffZ}`
 
-### ControlMessage
-
-Published by the Publisher at the start and end of a run.
+### ControlMessage (published by Publisher)
 
 ```json
 {
@@ -182,230 +213,26 @@ Published by the Publisher at the start and end of a run.
 }
 ```
 
-`event` is either `publisher-start` or `publisher-complete`.
+`event` is `publisher-start` or `publisher-complete`. **Do not remove the control message code from the Publisher** — the Scoreboard trigger depends on it.
 
 ---
 
-## Windowing Rules
+## Agentic Help (Aspire MCP)
 
-The Processor must aggregate telemetry readings into **fixed, non-overlapping 5-second windows** aligned to the Unix epoch (UTC).
-
-**Window assignment:** a reading with `eventTimeUtc = T` belongs to the window that starts at:
-
-```
-windowStart = floor(T_unix_ms / 5000) × 5000   (in milliseconds)
-windowEnd   = windowStart + 5000 ms
-```
-
-**Per device:** each device gets its own independent set of windows. A result covers exactly one device and one window.
-
-**Deduplication:** readings are deduplicated by `runId|teamId|deviceId|sequence` — each unique combination is counted at most once.
-
-**Grace period:** the Judge finalises a window **2 seconds** after `windowEnd`. Results that arrive after that are scored as `Invalid`.
-
----
-
-## Scoring
-
-The maximum score is **5000 points**, made up of five categories worth **1000 points each**. Each category scores linearly between its best and worst values.
-
-| Category | 1000 pts (best) | 0 pts (worst) | When |
-|---|---|---|---|
-| **Interval** | 50 ms | 1000 ms | Fixed at run start |
-| **Devices** | 50 000 devices | 1 device | Fixed at run start |
-| **Publish Attainment** | 100% published | 0% published | Live |
-| **Window Correctness** | 100% correct windows | 0% correct windows | Live |
-| **Latency** | 100 ms P95 | ≥ 1000 ms P95 | Live |
-
-**Total score = sum of all five categories** (max 5000).
-
-### Category formulas
-
-- **Interval score** — piecewise linear, steep at low latency, flattening toward 1000 ms:
-
-  | Interval | Score |
-  |---|---|
-  | ≤ 50 ms | 1000 |
-  | 100 ms | 800 |
-  | 250 ms | 500 |
-  | 500 ms | 250 |
-  | 750 ms | 100 |
-  | ≥ 1000 ms | 0 |
-
-  Values between anchors are linearly interpolated.
-
-- **Devices score** — log-linear from 1 to 10 000 devices, then linear to 50 000:
-
-  | Devices | Score |
-  |---|---|
-  | 10 | 50 |
-  | 100 | 100 |
-  | 1 000 | 200 |
-  | 10 000 | 500 |
-  | 50 000 | 1000 |
-
-  Below 10 000 devices: interpolated on a log₁₀ scale between the anchors above.
-  From 10 000 to 50 000 devices: linearly interpolated.
-
-- **Publish Attainment score** `= max(0, min(1000, 1000 × publishAttainment))`
-- **Window Correctness score** `= max(0, min(1000, 1000 × windowCorrectness))`
-- **Latency score** `= max(0, min(1000, 1000 × (1000 − latencyP95ms) / 900))` _(0 if no data yet)_
-
-### Scoreboard display
-
-The scoreboard shows a live bar widget for each run — one horizontal bar per category, coloured from red (0) to green (1000). The **Interval** and **Devices** bars are fixed as soon as the run starts; the remaining three update every few seconds during the run.
-
-### Window validation rules
-
-- The Judge computes a **theoretical count per device/window** from the configured run start, run duration, device count, and message interval.
-- The Judge also counts how many telemetry messages actually reached the broker for each device/window.
-- A window is **fully observed** only when the broker-observed count matches the theoretical count.
-- Processor results are scored as **Correct**, **Invalid**, or **Missing** only for fully observed windows.
-- Windows where the publisher did not hit the theoretical count are tracked separately as **publisher mismatch windows** and affect the Publish Attainment score.
-
----
-
-## The Task
-
-Your goal is to maximise the score produced by the Judge for your team's run.
-
-### Starting point
-
-The template Publisher and Processor are deliberately minimal. They work end-to-end but leave significant room for improvement:
-
-- `src/TeamActivity.Publisher` — emits telemetry and lifecycle control messages
-- `src/TeamActivity.Processor` — subscribes to telemetry, aggregates into windows, publishes results
-
-### What you should improve
-
-- Reduce result latency (publish results as close to `windowEnd` as possible)
-- Improve reliability (handle MQTT reconnects, ensure all windows are published)
-- Ensure correct aggregate calculations for all devices and windows
-- Use the Aspire dashboard logs, traces, and metrics to observe and debug your pipeline
-
-### What you must not change
-
-The following are the event's invariants — **do not modify** them:
-
-- `src/TeamActivity.Judge` — the impartial scorer
-- `src/TeamActivity.Scoreboard` — the leaderboard UI
-- `src/TeamActivity.Shared.Contracts` — MQTT topic patterns and JSON message schemas
-- `TeamActivity.AppHost` — the Aspire orchestration config
-- `scripts/` — the guardrail test scripts
-
-Keep the MQTT topic patterns and JSON field names exactly as defined above. Any deviation will result in `Invalid` or unscored messages.
-
----
-
-## Scoreboard Control Panel
-
-The Scoreboard is both a leaderboard and an **interactive run launcher**. Open it in a browser after starting Aspire — runs do **not** start automatically.
-
-### Starting a Run
-
-At the top of the Scoreboard page is the **Start a Run** control panel:
-
-| Control | Default | Description |
-|---|---|---|
-| **Device Count** | `3` | Number of simulated devices (`device-001` … `device-N`). Higher = more parallelism and more messages. |
-| **Message Interval (ms)** | `250` | Milliseconds between successive messages from each device. Lower = higher message rate. |
-| **Run Window (seconds)** | `120` | How long the Publisher emits messages. The 2-minute competitive window = 120. |
-| **Enable Chaos Mode** | unchecked | When checked, chaos disruptions are armed as soon as the run begins. |
-| **▶ Start Run** button | — | Sends the trigger to the Judge. The Publisher immediately begins emitting telemetry. |
-
-The **Run Status** badge updates every 2 seconds: **Idle** → **Pending** (trigger received, waiting for Publisher to acknowledge) → **Running** → **Idle** (run complete).
-
-The Start button and all inputs are **disabled** while a run is in progress. Multiple concurrent runs are not supported.
-
-### Starting a Run via the API (scripts)
-
-The same trigger endpoint is available directly on the Judge service:
-
-```bash
-curl -X POST http://localhost:5076/api/run/start \
-  -H 'Content-Type: application/json' \
-  -d '{"deviceCount":3,"intervalMs":250,"runWindowSeconds":120,"chaosEnabled":false}'
-```
-
-The response is `200 OK` with `{"runId":"<uuid>"}`, or `409 Conflict` if a run is already in progress.
-
----
-
-## Default Run Parameters
-
-The Publisher reads identity from its `appsettings.json`:
-
-| Parameter | Default | Notes |
-|---|---|---|
-| `teamId` | `team-template` | Set via `ChallengeOptions` — identifies your team on the Scoreboard |
-| `WindowSeconds` | `5` | Aggregation window size (fixed) |
-| `GraceSeconds` | `2` | Grace period before Judge finalises a window (fixed) |
-| `StartupDelaySeconds` | `3` | Publisher waits for Judge and Processor to be ready before polling for a trigger |
-
-**Run parameters are set per-run via the trigger** (Scoreboard UI or API), not in the Publisher config:
-
-| Parameter | Trigger field | Notes |
-|---|---|---|
-| Device Count | `deviceCount` | Simulated devices (`device-001` … `device-N`) |
-| Message Interval | `intervalMs` | Delay between messages in milliseconds |
-| Run Window | `runWindowSeconds` | Duration the Publisher emits telemetry |
-| Chaos Mode | `chaosEnabled` | Arms chaos disruptions for the run |
-
-**Message count is derived automatically per device** from `runWindowSeconds` and `intervalMs`. The theoretical total is:
-
-```text
-messagesPerDevice = ceil(runWindowSeconds × 1000 / intervalMs)
-theoreticalTotalMessages = deviceCount × messagesPerDevice
-```
-
-For example with the defaults (120 s window, 250 ms interval):
-- **3 devices × 480 messages** = 1 440 total messages
-- `100 ms` interval → 3 × 1 200 = **3 600 messages**
-- `50 ms` interval → 3 × 2 400 = **7 200 messages**
-
-**Each team must set their own `teamId`** in `Publisher/appsettings.json` (or via environment variable) so their results appear separately on the Scoreboard. The `runId` is generated automatically as a UUID for each triggered run.
-
----
-
-## Chaos Events
-
-The event runs in **two phases**:
-
-1. **Normal run** — no disruptions. Teams tune and test their pipeline.
-2. **Chaos run** — start a run with **Enable Chaos Mode** checked in the Scoreboard control panel (or `"chaosEnabled":true` in the API trigger). The Scoreboard shows an amber **"Chaos Mode"** banner when chaos is armed, and a red pulsing banner when a specific event is in progress.
-
-The organiser can fire specific chaos events during the run via the Judge chaos API (or via scripts). Teams know **what types of events can happen** (see below) but **not exactly when** they will be triggered — that is the challenge.
-
-### Event Types
-
-| Type | What happens | What your Processor must handle |
-|---|---|---|
-| `processor-restart` | Your Processor service is killed and restarts mid-run | Reconnect to MQTT, recover in-progress window state, resume publishing results |
-| `message-duplications` | Duplicate messages injected | Dedup by `sequence`, avoid double-counting, handle backpressure |
-| `message-gap` | Publisher pauses sending for several seconds | Keep open windows alive; do not close/discard windows prematurely |
-| `device-dropout` | One device stops sending for a period | Finalise that device's windows with the data you have; don't block other devices |
-| `high-latency` | Artificial delay injected between publisher and broker | Tighten your latency margin; publish results before the 2-second grace period expires |
-
-### Resilience Tips
-
-- **MQTT reconnect:** Register a reconnect handler and re-subscribe to the raw telemetry topic on reconnect. All in-progress window state should survive the reconnect.
-- **State preservation across restarts:** Persist window aggregates to a fast local store (or re-derive from any buffered messages) so a restart does not wipe your windows.
-- **Deduplication:** Always deduplicate by `runId|teamId|deviceId|sequence` — the Judge does this too; duplicates you publish as separate windows will be scored `Invalid`.
-- **Window timing:** Use `eventTimeUtc` (not wall clock) for window assignment. A burst or gap in wall time should not shift your window boundaries.
-
----
-
-## Agentic Assistance with Aspire MCP
-
-The Aspire dashboard exposes an MCP server that lets AI assistants (such as GitHub Copilot) inspect resources, logs, traces, and health without guessing.
+Connect your AI assistant to the Aspire MCP server for real-time introspection:
 
 ```bash
 aspire agent init
 ```
 
-Follow the prompts to configure your AI assistant. Useful prompts once connected:
+Useful prompts: *"Are all resources running?"* · *"Show logs for the processor."* · *"List traces involving the scoreboard."*
 
-- *Are all Aspire resources running?*
-- *Show console logs for the processor.*
-- *Show structured logs for the judge.*
-- *List traces involving the scoreboard.*
+---
+
+## Guardrail Tests
+
+```bash
+bash scripts/smoke-test.sh
+```
+
+Builds, starts Aspire, triggers a short run, validates scoring, and stops Aspire.
