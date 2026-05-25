@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text;
@@ -18,6 +19,9 @@ public sealed class Worker(
 {
     private static readonly Counter<long> TelemetryPublished = TelemetryMeters.Publisher.CreateCounter<long>("telemetry_published_total");
     private static readonly Counter<long> ControlPublished = TelemetryMeters.Publisher.CreateCounter<long>("control_published_total");
+    private static readonly Histogram<double> TickDrift = TelemetryMeters.Publisher.CreateHistogram<double>("publish_tick_drift_ms");
+
+    private volatile int _lastEmissionIndex;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -55,6 +59,15 @@ public sealed class Worker(
         };
         // ─────────────────────────────────────────────────────────────────────────
 
+        // Main client reconnect handler
+        client.DisconnectedAsync += async args =>
+        {
+            if (stoppingToken.IsCancellationRequested) return;
+
+            logger.LogWarning("Main client disconnected: {Reason}. Reconnecting...", args.Reason);
+            await ReconnectMainClient(client, mqtt, challenge, stoppingToken);
+        };
+
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"publisher-{challenge.TeamId}")
             .WithTcpServer(mqtt.Host, mqtt.Port)
@@ -64,13 +77,7 @@ public sealed class Worker(
         logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
         await client.ConnectAsync(options, stoppingToken);
 
-        var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-            .WithTopicFilter(filter => filter
-                .WithTopic(Topics.RunTrigger)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
-            .Build();
-
-        await client.SubscribeAsync(subscribeOptions, stoppingToken);
+        await SubscribeRunTrigger(client, stoppingToken);
         logger.LogInformation("Publisher connected and idle — waiting for a run trigger via MQTT.");
 
         await foreach (var trigger in triggerChannel.Reader.ReadAllAsync(stoppingToken))
@@ -101,16 +108,16 @@ public sealed class Worker(
             hasParent ? parentContext : default);
         activity?.SetTag("run.id", trigger.RunId);
 
+        var mqtt = mqttOptions.Value;
+        var pubOptions = publisherOptions.Value;
         var intervalMs = trigger.IntervalMs;
         var deviceCount = Math.Max(1, trigger.DeviceCount);
         var runWindowSeconds = Math.Max(1, trigger.RunWindowSeconds);
         var messagesPerDevice = RunMath.CalculateMessagesPerDevice(runWindowSeconds, intervalMs);
-        var theoreticalTotalMessages = RunMath.CalculateTheoreticalTelemetryCount(deviceCount, runWindowSeconds, intervalMs);
         var runId = trigger.RunId;
         var runStartedAtUtc = DateTimeOffset.UtcNow;
         var runEndsAtUtc = runStartedAtUtc.AddSeconds(runWindowSeconds);
-        long publishedCount = 0;
-        long sequence = 1;
+        var shardCount = pubOptions.ShardCount;
 
         // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
         // Signals the Judge and Scoreboard that this team's Publisher has started.
@@ -120,51 +127,99 @@ public sealed class Worker(
 
         var telemetryTopic = Topics.TelemetryRaw(runId, challenge.TeamId);
 
-        // ── YOUR CODE ─────────────────────────────────────────────────────────────
-        // Improve this loop to maximise your score:
-        //   - Make timing more precise so the interval score stays high under load
-        //   - Tune the `value` formula (the Judge doesn't care what values you emit,
-        //     but consistency helps when debugging aggregate correctness)
-        //   - Parallelise per-device publishing if you want to push interval lower
-        for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
+        // Pre-allocate device ID strings
+        var deviceIds = new string[deviceCount];
+        for (int d = 0; d < deviceCount; d++)
+            deviceIds[d] = $"device-{d + 1:000}";
+
+        // Create sharded channels
+        var shards = new Channel<MqttApplicationMessage>[shardCount];
+        for (int i = 0; i < shardCount; i++)
+            shards[i] = Channel.CreateBounded<MqttApplicationMessage>(
+                new BoundedChannelOptions(pubOptions.ChannelCapacity)
+                {
+                    SingleWriter = false,
+                    SingleReader = true,
+                    AllowSynchronousContinuations = false,
+                    FullMode = BoundedChannelFullMode.Wait
+                });
+
+        // Create and connect the connection pool
+        await using var pool = new ConnectionPool(
+            pubOptions.ConnectionCount, mqtt.Host, mqtt.Port, challenge.TeamId, logger);
+        await pool.ConnectAllAsync(stoppingToken);
+
+        // Start drain loops (one task per shard)
+        var drainTasks = pool.StartDrainLoops(shards, stoppingToken);
+
+        // Tick generator loop
+        long sequence = 1;
+        _lastEmissionIndex = 0;
+        long publishedCount = 0;
+
+        try
         {
-            var scheduledAtUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
-            var delay = scheduledAtUtc - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
+            for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
             {
-                await Task.Delay(delay, stoppingToken);
-            }
+                if (stoppingToken.IsCancellationRequested) break;
 
-            if (DateTimeOffset.UtcNow >= runEndsAtUtc)
-            {
-                logger.LogWarning(
-                    "Run {RunId} ended before all scheduled emissions could be sent. Published={PublishedCount}, Theoretical={TheoreticalTotalMessages}",
-                    runId,
-                    publishedCount,
-                    theoreticalTotalMessages);
-                break;
-            }
+                var scheduledUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
+                var now = DateTimeOffset.UtcNow;
 
-            for (var deviceNumber = 1; deviceNumber <= deviceCount; deviceNumber++)
-            {
+                if (scheduledUtc > now)
+                {
+                    await Task.Delay(scheduledUtc - now, stoppingToken);
+                }
+
+                if (DateTimeOffset.UtcNow >= runEndsAtUtc)
+                {
+                    logger.LogWarning(
+                        "Run {RunId} ended before all emissions sent. Published={Published}, Expected={Expected}",
+                        runId, publishedCount, (long)messagesPerDevice * deviceCount);
+                    break;
+                }
+
                 var publishedAtUtc = DateTimeOffset.UtcNow;
-                var telemetry = new TelemetryMessage(
-                    Topics.SchemaVersion,
-                    runId,
-                    challenge.TeamId,
-                    $"device-{deviceNumber:000}",
-                    sequence++,
-                    scheduledAtUtc,
-                    publishedAtUtc,
-                    40 + deviceNumber + emissionIndex / 10.0);
+                var drift = (publishedAtUtc - scheduledUtc).TotalMilliseconds;
+                TickDrift.Record(drift);
 
-                var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
-                await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
-                publishedCount++;
-                TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
+                // Generate messages for all devices this tick
+                for (int d = 0; d < deviceCount; d++)
+                {
+                    var deviceId = deviceIds[d];
+                    var seq = sequence++;
+                    var value = 40.0 + (d + 1) + emissionIndex / 10.0;
+
+                    var payload = SerializeTelemetry(
+                        telemetryTopic, runId, challenge.TeamId, deviceId, seq,
+                        scheduledUtc, publishedAtUtc, value);
+
+                    var shardIdx = d & (shardCount - 1);
+                    await shards[shardIdx].Writer.WriteAsync(payload, stoppingToken);
+                    publishedCount++;
+                }
+
+                Interlocked.Exchange(ref _lastEmissionIndex, emissionIndex);
+                TelemetryPublished.Add(deviceCount, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
             }
         }
-        // ─────────────────────────────────────────────────────────────────────────
+        finally
+        {
+            // Complete all shard writers to signal drain loops to finish
+            for (int i = 0; i < shardCount; i++)
+                shards[i].Writer.Complete();
+
+            // Wait for all drain tasks to finish (messages flushed to broker)
+            try
+            {
+                await Task.WhenAll(drainTasks).WaitAsync(TimeSpan.FromSeconds(5), stoppingToken);
+            }
+            catch (TimeoutException)
+            {
+                logger.LogWarning("Drain tasks did not complete within timeout for run {RunId}", runId);
+            }
+            catch (OperationCanceledException) { }
+        }
 
         // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
         // Signals the Judge and Scoreboard that this run is complete.
@@ -172,6 +227,71 @@ public sealed class Worker(
         await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken,
             traceParent: activity?.Id);
         // ─────────────────────────────────────────────────────────────────────────
+    }
+
+    private static MqttApplicationMessage SerializeTelemetry(
+        string topic, string runId, string teamId, string deviceId,
+        long sequence, DateTimeOffset eventTimeUtc, DateTimeOffset publishedAtUtc, double value)
+    {
+        var telemetry = new TelemetryMessage(
+            Topics.SchemaVersion, runId, teamId, deviceId,
+            sequence, eventTimeUtc, publishedAtUtc, value);
+
+        var payload = JsonSerializer.SerializeToUtf8Bytes(telemetry, JsonContract.Options);
+
+        return new MqttApplicationMessageBuilder()
+            .WithTopic(topic)
+            .WithPayload(payload)
+            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce)
+            .Build();
+    }
+
+    private async Task ReconnectMainClient(IMqttClient client, MqttOptions mqtt, ChallengeOptions challenge, CancellationToken cancellationToken)
+    {
+        var baseDelayMs = 100;
+        var maxDelayMs = 5000;
+        var attempt = 0;
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                var jitter = Random.Shared.Next(0, 100);
+                var delayMs = Math.Min(baseDelayMs * (1 << attempt), maxDelayMs) + jitter;
+                await Task.Delay(delayMs, cancellationToken);
+
+                var options = new MqttClientOptionsBuilder()
+                    .WithClientId($"publisher-{challenge.TeamId}")
+                    .WithTcpServer(mqtt.Host, mqtt.Port)
+                    .WithCleanStart()
+                    .Build();
+
+                await client.ConnectAsync(options, cancellationToken);
+                await SubscribeRunTrigger(client, cancellationToken);
+                logger.LogInformation("Main client reconnected after {Attempts} attempts", attempt + 1);
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                logger.LogDebug(ex, "Main client reconnect attempt {Attempt} failed", attempt);
+            }
+        }
+    }
+
+    private static Task SubscribeRunTrigger(IMqttClient client, CancellationToken cancellationToken)
+    {
+        var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
+            .WithTopicFilter(filter => filter
+                .WithTopic(Topics.RunTrigger)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
+            .Build();
+
+        return client.SubscribeAsync(subscribeOptions, cancellationToken);
     }
 
     private static Task PublishControl(
