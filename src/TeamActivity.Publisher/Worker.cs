@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using MQTTnet;
+using MQTTnet.Formatter;
 using MQTTnet.Protocol;
 using TeamActivity.Shared.Contracts;
 
@@ -22,9 +23,15 @@ public sealed class Worker(
     private static readonly Histogram<double> TickDrift = TelemetryMeters.Publisher.CreateHistogram<double>("publish_tick_drift_ms");
 
     private volatile int _lastEmissionIndex;
+    private string _mqttHost = "localhost";
+    private int _mqttPort = 1883;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var buildTime = File.GetLastWriteTimeUtc(typeof(Worker).Assembly.Location);
+        logger.LogInformation("Publisher started. Build={BuildTime:yyyy-MM-dd HH:mm:ss}Z, PID={PID}",
+            buildTime, Environment.ProcessId);
+
         var startupDelay = TimeSpan.FromSeconds(Math.Max(0, publisherOptions.Value.StartupDelaySeconds));
         if (startupDelay > TimeSpan.Zero)
         {
@@ -33,6 +40,11 @@ public sealed class Worker(
 
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
+
+        // Resolve Mosquitto's container IP to bypass Docker NAT port-forwarding
+        _mqttHost = await ResolveMosquittoContainerIp(mqtt.Host);
+        _mqttPort = _mqttHost != mqtt.Host ? 1883 : mqtt.Port;
+        logger.LogInformation("Publisher using MQTT broker at {Host}:{Port}", _mqttHost, _mqttPort);
 
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
@@ -64,17 +76,23 @@ public sealed class Worker(
         {
             if (stoppingToken.IsCancellationRequested) return;
 
-            logger.LogWarning("Main client disconnected: {Reason}. Reconnecting...", args.Reason);
+            logger.LogWarning(
+                "Main client disconnected: Reason={Reason}, ClientWasConnected={WasConnected}, ReasonString={ReasonString}, Exception={ExType} {ExMsg}",
+                args.Reason, args.ClientWasConnected,
+                args.ReasonString ?? "(null)",
+                args.Exception?.GetType().Name ?? "(none)",
+                args.Exception?.Message ?? "");
             await ReconnectMainClient(client, mqtt, challenge, stoppingToken);
         };
 
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"publisher-{challenge.TeamId}")
-            .WithTcpServer(mqtt.Host, mqtt.Port)
-            .WithCleanStart()
+            .WithTcpServer(_mqttHost, _mqttPort)
+            .WithProtocolVersion(MqttProtocolVersion.V311)
+            .WithCleanSession()
             .Build();
 
-        logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
+        logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", _mqttHost, _mqttPort);
         await client.ConnectAsync(options, stoppingToken);
 
         await SubscribeRunTrigger(client, stoppingToken);
@@ -132,36 +150,43 @@ public sealed class Worker(
         for (int d = 0; d < deviceCount; d++)
             deviceIds[d] = $"device-{d + 1:000}";
 
-        // Create sharded channels
-        var shards = new Channel<MqttApplicationMessage>[shardCount];
+        // Create sharded channels — DropOldest ensures the generator never blocks
+        var shards = new Channel<TelemetryEnvelope>[shardCount];
         for (int i = 0; i < shardCount; i++)
-            shards[i] = Channel.CreateBounded<MqttApplicationMessage>(
+            shards[i] = Channel.CreateBounded<TelemetryEnvelope>(
                 new BoundedChannelOptions(pubOptions.ChannelCapacity)
                 {
                     SingleWriter = false,
                     SingleReader = true,
                     AllowSynchronousContinuations = false,
-                    FullMode = BoundedChannelFullMode.Wait
+                    FullMode = BoundedChannelFullMode.DropOldest
                 });
 
         // Create and connect the connection pool
         await using var pool = new ConnectionPool(
-            pubOptions.ConnectionCount, mqtt.Host, mqtt.Port, challenge.TeamId, logger);
+            pubOptions.ConnectionCount, _mqttHost, _mqttPort, challenge.TeamId, logger, pubOptions.MaxPublishRetryAttempts);
         await pool.ConnectAllAsync(stoppingToken);
 
         // Start drain loops (one task per shard)
-        var drainTasks = pool.StartDrainLoops(shards, stoppingToken);
+        var drainTasks = pool.StartDrainLoops(shards, telemetryTopic, stoppingToken);
 
-        // Tick generator loop
+        // Tick generator loop — emit all devices per tick immediately, no slicing
         long sequence = 1;
         _lastEmissionIndex = 0;
         long publishedCount = 0;
+        long droppedCount = 0;
+        var endedEarly = false;
 
         try
         {
             for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
             {
                 if (stoppingToken.IsCancellationRequested) break;
+                if (DateTimeOffset.UtcNow >= runEndsAtUtc)
+                {
+                    endedEarly = true;
+                    break;
+                }
 
                 var scheduledUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
                 var now = DateTimeOffset.UtcNow;
@@ -171,36 +196,47 @@ public sealed class Worker(
                     await Task.Delay(scheduledUtc - now, stoppingToken);
                 }
 
-                if (DateTimeOffset.UtcNow >= runEndsAtUtc)
-                {
-                    logger.LogWarning(
-                        "Run {RunId} ended before all emissions sent. Published={Published}, Expected={Expected}",
-                        runId, publishedCount, (long)messagesPerDevice * deviceCount);
-                    break;
-                }
-
                 var publishedAtUtc = DateTimeOffset.UtcNow;
                 var drift = (publishedAtUtc - scheduledUtc).TotalMilliseconds;
                 TickDrift.Record(drift);
 
-                // Generate messages for all devices this tick
+                // Emit all devices for this tick immediately — no sub-slicing
                 for (int d = 0; d < deviceCount; d++)
                 {
-                    var deviceId = deviceIds[d];
                     var seq = sequence++;
                     var value = 40.0 + (d + 1) + emissionIndex / 10.0;
 
-                    var payload = SerializeTelemetry(
-                        telemetryTopic, runId, challenge.TeamId, deviceId, seq,
+                    var telemetry = new TelemetryEnvelope(
+                        runId, challenge.TeamId, deviceIds[d], seq,
                         scheduledUtc, publishedAtUtc, value);
 
-                    var shardIdx = d & (shardCount - 1);
-                    await shards[shardIdx].Writer.WriteAsync(payload, stoppingToken);
-                    publishedCount++;
+                    var shardIdx = d % shardCount;
+                    if (shards[shardIdx].Writer.TryWrite(telemetry))
+                    {
+                        publishedCount++;
+                    }
+                    else
+                    {
+                        droppedCount++;
+                    }
                 }
 
                 Interlocked.Exchange(ref _lastEmissionIndex, emissionIndex);
                 TelemetryPublished.Add(deviceCount, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
+            }
+
+            if (endedEarly)
+            {
+                logger.LogWarning(
+                    "Run {RunId} ended before all emissions sent. Published={Published}, Expected={Expected}",
+                    runId, publishedCount, (long)messagesPerDevice * deviceCount);
+            }
+
+            if (droppedCount > 0)
+            {
+                logger.LogWarning(
+                    "Run {RunId} dropped {Dropped} messages due to channel backpressure",
+                    runId, droppedCount);
             }
         }
         finally
@@ -209,14 +245,16 @@ public sealed class Worker(
             for (int i = 0; i < shardCount; i++)
                 shards[i].Writer.Complete();
 
-            // Wait for all drain tasks to finish (messages flushed to broker)
+            // Wait for all drain tasks to finish so telemetry is flushed before publisher-complete.
             try
             {
-                await Task.WhenAll(drainTasks).WaitAsync(TimeSpan.FromSeconds(5), stoppingToken);
+                await Task.WhenAll(drainTasks).WaitAsync(
+                    TimeSpan.FromSeconds(Math.Max(1, pubOptions.DrainTimeoutSeconds)),
+                    stoppingToken);
             }
             catch (TimeoutException)
             {
-                logger.LogWarning("Drain tasks did not complete within timeout for run {RunId}", runId);
+                logger.LogWarning("Drain tasks exceeded timeout for run {RunId}", runId);
             }
             catch (OperationCanceledException) { }
         }
@@ -227,23 +265,6 @@ public sealed class Worker(
         await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken,
             traceParent: activity?.Id);
         // ─────────────────────────────────────────────────────────────────────────
-    }
-
-    private static MqttApplicationMessage SerializeTelemetry(
-        string topic, string runId, string teamId, string deviceId,
-        long sequence, DateTimeOffset eventTimeUtc, DateTimeOffset publishedAtUtc, double value)
-    {
-        var telemetry = new TelemetryMessage(
-            Topics.SchemaVersion, runId, teamId, deviceId,
-            sequence, eventTimeUtc, publishedAtUtc, value);
-
-        var payload = JsonSerializer.SerializeToUtf8Bytes(telemetry, JsonContract.Options);
-
-        return new MqttApplicationMessageBuilder()
-            .WithTopic(topic)
-            .WithPayload(payload)
-            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce)
-            .Build();
     }
 
     private async Task ReconnectMainClient(IMqttClient client, MqttOptions mqtt, ChallengeOptions challenge, CancellationToken cancellationToken)
@@ -262,8 +283,9 @@ public sealed class Worker(
 
                 var options = new MqttClientOptionsBuilder()
                     .WithClientId($"publisher-{challenge.TeamId}")
-                    .WithTcpServer(mqtt.Host, mqtt.Port)
-                    .WithCleanStart()
+                    .WithTcpServer(_mqttHost, _mqttPort)
+                    .WithProtocolVersion(MqttProtocolVersion.V311)
+                    .WithCleanSession()
                     .Build();
 
                 await client.ConnectAsync(options, cancellationToken);
@@ -339,5 +361,51 @@ public sealed class Worker(
             .Build();
 
         return client.PublishAsync(message, cancellationToken);
+    }
+
+    private async Task<string> ResolveMosquittoContainerIp(string configuredHost)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("bash", "-c \"docker ps --filter ancestor=eclipse-mosquitto:2.0 --format '{{.ID}}' | head -1\"")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi)!;
+            var containerId = (await proc.StandardOutput.ReadToEndAsync()).Trim();
+            await proc.WaitForExitAsync();
+
+            if (string.IsNullOrEmpty(containerId))
+            {
+                logger.LogWarning("Could not find Mosquitto container, falling back to {Host}", configuredHost);
+                return configuredHost;
+            }
+
+            var psi2 = new System.Diagnostics.ProcessStartInfo("bash", $"-c \"docker inspect -f '{{{{range .NetworkSettings.Networks}}}}{{{{.IPAddress}}}}{{{{end}}}}' {containerId}\"")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc2 = System.Diagnostics.Process.Start(psi2)!;
+            var ip = (await proc2.StandardOutput.ReadToEndAsync()).Trim();
+            await proc2.WaitForExitAsync();
+
+            if (!string.IsNullOrEmpty(ip) && ip.Contains('.'))
+            {
+                logger.LogInformation("Resolved Mosquitto container IP: {IP} (bypassing Docker NAT)", ip);
+                return ip;
+            }
+
+            logger.LogWarning("Could not resolve container IP, falling back to {Host}", configuredHost);
+            return configuredHost;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Container IP resolution failed, falling back to {Host}", configuredHost);
+            return configuredHost;
+        }
     }
 }

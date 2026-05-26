@@ -5,19 +5,19 @@ public sealed class ProcessorOptions
     /// <summary>Number of partition workers. 0 = Environment.ProcessorCount.</summary>
     public int PartitionCount { get; init; } = 0;
 
-    /// <summary>Bounded capacity per ingest partition channel.</summary>
-    public int ChannelCapacity { get; init; } = 10_000;
+    /// <summary>Number of shared-subscription MQTT connections for receiving telemetry.</summary>
+    public int SubscribeConnectionCount { get; init; } = 16;
 
     /// <summary>Number of MQTT connections for result publishing.</summary>
-    public int PublishConnectionCount { get; init; } = 4;
+    public int PublishConnectionCount { get; init; } = 32;
 
     /// <summary>Bounded capacity of the shared result publish channel.</summary>
     public int PublishChannelCapacity { get; init; } = 50_000;
 
     /// <summary>How often each worker checks for due windows (ms).</summary>
-    public int FlushCheckIntervalMs { get; init; } = 20;
+    public int FlushCheckIntervalMs { get; init; } = 5;
 
-    /// <summary>Grace period (ms) after windowEnd before flushing. Allows late-arriving messages to be included.</summary>
+    /// <summary>Grace period (ms) after windowEnd before flushing.</summary>
     public int WindowGraceMs { get; init; } = 50;
 
     public int ResolvedPartitionCount =>

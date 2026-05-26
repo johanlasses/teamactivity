@@ -23,6 +23,7 @@ public sealed class ResultPublishPool : IAsyncDisposable
     private readonly int _port;
     private readonly string _teamId;
     private readonly ILogger _logger;
+    private readonly int[] _reconnectInProgress;
 
     public ResultPublishPool(int connectionCount, string host, int port, string teamId, ILogger logger)
     {
@@ -32,6 +33,7 @@ public sealed class ResultPublishPool : IAsyncDisposable
         _teamId = teamId;
         _logger = logger;
         _clients = new IMqttClient[connectionCount];
+        _reconnectInProgress = new int[connectionCount];
 
         var factory = new MqttClientFactory();
         for (int i = 0; i < connectionCount; i++)
@@ -51,18 +53,26 @@ public sealed class ResultPublishPool : IAsyncDisposable
             client.DisconnectedAsync += async args =>
             {
                 if (cancellationToken.IsCancellationRequested) return;
+                if (Interlocked.CompareExchange(ref _reconnectInProgress[index], 1, 0) != 0) return;
 
-                ReconnectsTotal.Add(1, new KeyValuePair<string, object?>("connection", index));
-                _logger.LogWarning("Publish connection {Index} disconnected: {Reason}. Reconnecting...",
-                    index, args.Reason);
-
-                await ReconnectWithBackoff(client, index, cancellationToken);
+                try
+                {
+                    ReconnectsTotal.Add(1, new KeyValuePair<string, object?>("connection", index));
+                    _logger.LogWarning("Publish connection {Index} disconnected: {Reason}. Reconnecting...",
+                        index, args.Reason);
+                    await ReconnectWithBackoff(client, index, cancellationToken);
+                }
+                finally
+                {
+                    Volatile.Write(ref _reconnectInProgress[index], 0);
+                }
             };
 
             var options = new MqttClientOptionsBuilder()
                 .WithClientId($"processor-pub-{_teamId}-{i}")
                 .WithTcpServer(_host, _port)
-                .WithCleanStart()
+                .WithProtocolVersion(MQTTnet.Formatter.MqttProtocolVersion.V311)
+                .WithCleanSession()
                 .Build();
 
             connectTasks[i] = client.ConnectAsync(options, cancellationToken);
@@ -135,7 +145,8 @@ public sealed class ResultPublishPool : IAsyncDisposable
                 var options = new MqttClientOptionsBuilder()
                     .WithClientId($"processor-pub-{_teamId}-{index}")
                     .WithTcpServer(_host, _port)
-                    .WithCleanStart()
+                    .WithProtocolVersion(MQTTnet.Formatter.MqttProtocolVersion.V311)
+                    .WithCleanSession()
                     .Build();
 
                 await client.ConnectAsync(options, cancellationToken);

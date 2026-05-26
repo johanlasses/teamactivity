@@ -1,4 +1,7 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
@@ -16,128 +19,122 @@ public sealed class Worker(
 {
     private static readonly Counter<long> TelemetryConsumed =
         TelemetryMeters.Processor.CreateCounter<long>("telemetry_consumed_total");
-    private static readonly Counter<long> DedupDiscarded =
-        TelemetryMeters.Processor.CreateCounter<long>("dedup_discarded_total");
-    private static readonly Counter<long> LateDataDiscarded =
-        TelemetryMeters.Processor.CreateCounter<long>("late_data_discarded_total");
-    private static readonly Counter<long> IngestDropped =
-        TelemetryMeters.Processor.CreateCounter<long>("ingest_dropped_total");
+
+    // Aggregation state — protected by _gate lock
+    private readonly object _gate = new();
+    private readonly Dictionary<WindowKey, WindowState> _windows = new();
+    private readonly HashSet<WindowKey> _publishedWindows = new();
+    private readonly HashSet<long> _dedupSet = new();
+    private string? _currentRunId;
+    private long _consumedCount;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var buildTime = File.GetLastWriteTimeUtc(typeof(Worker).Assembly.Location);
+        logger.LogInformation("Processor started. Build={BuildTime:yyyy-MM-dd HH:mm:ss}Z, PID={PID}",
+            buildTime, Environment.ProcessId);
+
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
         var procOpts = processorOptions.Value;
-        var partitionCount = procOpts.ResolvedPartitionCount;
         var wildcardTopic = Topics.TelemetryRawWildcard(challenge.TeamId);
 
-        // Create partitioned ingest channels
-        var partitions = new Channel<TelemetryMessage>[partitionCount];
-        for (int i = 0; i < partitionCount; i++)
-        {
-            partitions[i] = Channel.CreateBounded<TelemetryMessage>(
-                new BoundedChannelOptions(procOpts.ChannelCapacity)
-                {
-                    SingleWriter = true,
-                    SingleReader = true,
-                    AllowSynchronousContinuations = false,
-                    FullMode = BoundedChannelFullMode.Wait
-                });
-        }
+        // Resolve Mosquitto's container IP to bypass Docker NAT port-forwarding
+        var mqttHost = await ResolveMosquittoContainerIp(mqtt.Host);
+        var mqttPort = mqttHost != mqtt.Host ? 1883 : mqtt.Port;
+        logger.LogInformation("Using MQTT broker at {Host}:{Port}", mqttHost, mqttPort);
 
-        // Create result publish channel (multiple writers, multiple readers)
+        // Result publish channel
         var resultChannel = Channel.CreateBounded<MqttApplicationMessage>(
             new BoundedChannelOptions(procOpts.PublishChannelCapacity)
             {
-                SingleWriter = false,
+                SingleWriter = true,
                 SingleReader = false,
                 AllowSynchronousContinuations = false,
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        // Set up publish pool
+        // Set up publish pool with many connections (reduces per-connection batch latency)
         await using var publishPool = new ResultPublishPool(
-            procOpts.PublishConnectionCount, mqtt.Host, mqtt.Port, challenge.TeamId, logger);
+            procOpts.PublishConnectionCount, mqttHost, mqttPort, challenge.TeamId, logger);
         await publishPool.ConnectAllAsync(stoppingToken);
         var drainTasks = publishPool.StartDrainLoops(resultChannel.Reader, stoppingToken);
 
-        // Start partition worker tasks BEFORE subscribing (so ingest capacity is ready)
-        var workerTasks = new Task[partitionCount];
-        for (int i = 0; i < partitionCount; i++)
-        {
-            var partitionId = i;
-            workerTasks[i] = Task.Run(
-                () => RunPartitionWorker(partitions[partitionId].Reader, resultChannel.Writer, challenge, procOpts, partitionId, stoppingToken),
-                stoppingToken);
-        }
-
-        // Set up subscribe client — register handler BEFORE connect
+        // Single subscriber client
         var factory = new MqttClientFactory();
-        using var client = factory.CreateMqttClient();
+        using var subClient = factory.CreateMqttClient();
 
-        client.ApplicationMessageReceivedAsync += async args =>
+        subClient.ApplicationMessageReceivedAsync += args =>
         {
-            try
-            {
-                await HandleIncomingAsync(args.ApplicationMessage, challenge, partitions, partitionCount, stoppingToken);
-            }
-            catch (OperationCanceledException) { }
+            HandleIncoming(args.ApplicationMessage, challenge);
+            return Task.CompletedTask;
         };
 
-        // Reconnect handler
-        client.DisconnectedAsync += async args =>
+        subClient.DisconnectedAsync += async args =>
         {
             if (stoppingToken.IsCancellationRequested) return;
-            logger.LogWarning("Processor subscribe client disconnected: {Reason}. Reconnecting...", args.Reason);
-            await ReconnectSubscribeClient(client, mqtt, wildcardTopic, stoppingToken);
+            logger.LogWarning(
+                "Subscriber disconnected: Reason={Reason}, ClientWasConnected={WasConnected}, ReasonString={ReasonString}, Exception={ExType} {ExMsg}",
+                args.Reason, args.ClientWasConnected,
+                args.ReasonString ?? "(null)",
+                args.Exception?.GetType().Name ?? "(none)",
+                args.Exception?.Message ?? "");
+            await ReconnectSubscriber(subClient, mqttHost, mqttPort, wildcardTopic, challenge.TeamId, stoppingToken);
         };
 
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"processor-{challenge.TeamId}")
-            .WithTcpServer(mqtt.Host, mqtt.Port)
+            .WithTcpServer(mqttHost, mqttPort)
             .WithCleanStart()
             .Build();
 
-        logger.LogInformation("Connecting processor to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
-        await client.ConnectAsync(options, stoppingToken);
+        await subClient.ConnectAsync(options, stoppingToken);
+        await subClient.SubscribeAsync(
+            new MqttClientSubscribeOptionsBuilder()
+                .WithTopicFilter(f => f
+                    .WithTopic(wildcardTopic)
+                    .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
+                .Build(), stoppingToken);
 
-        var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-            .WithTopicFilter(filter => filter
-                .WithTopic(wildcardTopic)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
-            .Build();
+        logger.LogInformation("Processor subscribed (single client) to {Topic}", wildcardTopic);
 
-        await client.SubscribeAsync(subscribeOptions, stoppingToken);
-        logger.LogInformation("Processor subscribed to {Topic} with {Partitions} worker partitions", wildcardTopic, partitionCount);
+        // Flush loop
+        var flushTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(procOpts.FlushCheckIntervalMs));
+        var flushTask = Task.Run(async () =>
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await flushTimer.WaitForNextTickAsync(stoppingToken);
+                    await FlushDueWindows(resultChannel.Writer, challenge, procOpts.WindowGraceMs, stoppingToken);
+                }
+                catch (OperationCanceledException) { break; }
+            }
+        }, stoppingToken);
 
-        // Wait for cancellation
         try
         {
             await Task.Delay(Timeout.Infinite, stoppingToken);
         }
         catch (OperationCanceledException) { }
 
-        // Shutdown: complete all partition channels so workers can finish
-        for (int i = 0; i < partitionCount; i++)
-            partitions[i].Writer.Complete();
+        logger.LogInformation("Processor shutting down. Consumed {Count} messages", _consumedCount);
 
-        await Task.WhenAll(workerTasks).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        // Final flush
+        await FlushDueWindows(resultChannel.Writer, challenge, windowGraceMs: 0, stoppingToken);
 
         resultChannel.Writer.Complete();
         await Task.WhenAll(drainTasks).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        flushTimer.Dispose();
+        await flushTask.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
     }
 
     /// <summary>
-    /// MQTT callback — parse and route to the correct partition channel.
-    /// Uses WriteAsync for backpressure (stalls dispatch if channel full, which is preferred
-    /// over silently dropping messages that would corrupt aggregates).
+    /// Fast inline message handler — called sequentially from MQTTnet receive loop.
+    /// Synchronized with FlushLoop via _gate lock.
     /// </summary>
-    private async ValueTask HandleIncomingAsync(
-        MqttApplicationMessage message,
-        ChallengeOptions challenge,
-        Channel<TelemetryMessage>[] partitions,
-        int partitionCount,
-        CancellationToken ct)
+    private void HandleIncoming(MqttApplicationMessage message, ChallengeOptions challenge)
     {
         TelemetryMessage? telemetry;
         try
@@ -156,164 +153,94 @@ public sealed class Worker(
         if (telemetry.TeamId != challenge.TeamId)
             return;
 
+        _consumedCount++;
         TelemetryConsumed.Add(1);
 
-        // Route to partition based on deviceId hash
-        var partition = (telemetry.DeviceId.GetHashCode() & 0x7FFFFFFF) % partitionCount;
-
-        // WriteAsync provides backpressure: if channel is full, we block MQTTnet dispatch
-        // which causes broker-side buffering/drops visible to both Processor and Judge equally.
-        // Fallback to TryWrite only on cancellation.
-        if (!partitions[partition].Writer.TryWrite(telemetry))
+        lock (_gate)
         {
-            try
+            // Handle run change
+            if (_currentRunId is not null && _currentRunId != telemetry.RunId)
             {
-                await partitions[partition].Writer.WriteAsync(telemetry, ct);
+                _windows.Clear();
+                _publishedWindows.Clear();
+                _dedupSet.Clear();
+                _currentRunId = telemetry.RunId;
             }
-            catch (OperationCanceledException)
+            else if (_currentRunId is null)
             {
-                IngestDropped.Add(1);
+                _currentRunId = telemetry.RunId;
             }
+
+            // Dedup by sequence
+            if (!_dedupSet.Add(telemetry.Sequence))
+                return;
+
+            var windowKey = WindowMath.Assign(telemetry, challenge.WindowSeconds);
+
+            // Skip if already published
+            if (_publishedWindows.Contains(windowKey))
+                return;
+
+            // Get or create window state and aggregate
+            if (!_windows.TryGetValue(windowKey, out var state))
+            {
+                state = new WindowState();
+                _windows[windowKey] = state;
+            }
+
+            state.Count++;
+            state.Sum += telemetry.Value;
+            if (telemetry.Value < state.Min) state.Min = telemetry.Value;
+            if (telemetry.Value > state.Max) state.Max = telemetry.Value;
         }
     }
 
-    /// <summary>
-    /// Partition worker: aggregates telemetry, deduplicates, and flushes closed windows.
-    /// Single reader per channel — no locks needed on partition-local state.
-    /// </summary>
-    private async Task RunPartitionWorker(
-        ChannelReader<TelemetryMessage> reader,
+    private async ValueTask FlushDueWindows(
         ChannelWriter<MqttApplicationMessage> resultWriter,
         ChallengeOptions challenge,
-        ProcessorOptions procOpts,
-        int partitionId,
-        CancellationToken ct)
-    {
-        var windows = new Dictionary<WindowKey, AggregateWindow>();
-        var publishedWindows = new HashSet<WindowKey>();
-        var dedupSet = new HashSet<long>();
-        string? currentRunId = null;
-        var flushCheckMs = procOpts.FlushCheckIntervalMs;
-        var windowGraceMs = procOpts.WindowGraceMs;
-
-        while (!ct.IsCancellationRequested)
-        {
-            // Process available messages with a deadline-based approach
-            var deadline = Environment.TickCount64 + flushCheckMs;
-
-            while (Environment.TickCount64 < deadline)
-            {
-                if (reader.TryRead(out var msg))
-                {
-                    ProcessMessage(msg, ref currentRunId, windows, publishedWindows, dedupSet, challenge, resultWriter, ct);
-                }
-                else
-                {
-                    var remaining = (int)(deadline - Environment.TickCount64);
-                    if (remaining <= 0) break;
-
-                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    cts.CancelAfter(remaining);
-                    try
-                    {
-                        if (!await reader.WaitToReadAsync(cts.Token))
-                            return; // channel completed
-                    }
-                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                    {
-                        break; // timeout, go flush
-                    }
-                }
-            }
-
-            // Flush closed windows
-            await FlushDueWindowsAsync(windows, publishedWindows, resultWriter, windowGraceMs, ct);
-        }
-
-        // Final flush on shutdown (no grace)
-        await FlushDueWindowsAsync(windows, publishedWindows, resultWriter, windowGraceMs: 0, ct);
-    }
-
-    private void ProcessMessage(
-        TelemetryMessage telemetry,
-        ref string? currentRunId,
-        Dictionary<WindowKey, AggregateWindow> windows,
-        HashSet<WindowKey> publishedWindows,
-        HashSet<long> dedupSet,
-        ChallengeOptions challenge,
-        ChannelWriter<MqttApplicationMessage> resultWriter,
-        CancellationToken ct)
-    {
-        // Run change detection — flush remaining old-run windows, then reset state
-        if (currentRunId is not null && currentRunId != telemetry.RunId)
-        {
-            logger.LogInformation("Partition detected new runId ({NewRunId}), flushing and clearing state.", telemetry.RunId);
-            // Flush any remaining windows from the old run before clearing
-            FlushDueWindowsAsync(windows, publishedWindows, resultWriter, windowGraceMs: 0, ct)
-                .AsTask().GetAwaiter().GetResult();
-            windows.Clear();
-            publishedWindows.Clear();
-            dedupSet.Clear();
-        }
-        currentRunId = telemetry.RunId;
-
-        // Deduplication: sequence is globally unique within a run
-        if (!dedupSet.Add(telemetry.Sequence))
-        {
-            DedupDiscarded.Add(1);
-            return;
-        }
-
-        var windowKey = WindowMath.Assign(telemetry, challenge.WindowSeconds);
-
-        // Skip messages for already-published windows (late data past our grace)
-        if (publishedWindows.Contains(windowKey))
-        {
-            LateDataDiscarded.Add(1);
-            return;
-        }
-
-        if (!windows.TryGetValue(windowKey, out var aggregate))
-        {
-            aggregate = new AggregateWindow();
-            windows.Add(windowKey, aggregate);
-        }
-
-        aggregate.Add(telemetry.Value);
-    }
-
-    private async ValueTask FlushDueWindowsAsync(
-        Dictionary<WindowKey, AggregateWindow> windows,
-        HashSet<WindowKey> publishedWindows,
-        ChannelWriter<MqttApplicationMessage> resultWriter,
         int windowGraceMs,
         CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
         var graceSpan = TimeSpan.FromMilliseconds(windowGraceMs);
+        List<(WindowKey key, WindowState state)>? toPublish = null;
 
-        // Collect keys to flush (avoid modifying dictionary during iteration)
-        List<WindowKey>? toFlush = null;
-
-        foreach (var (key, _) in windows)
+        lock (_gate)
         {
-            if (publishedWindows.Contains(key))
-                continue;
+            var keysToRemove = (List<WindowKey>?)null;
 
-            if (now >= key.WindowEndUtc + graceSpan)
+            foreach (var (key, state) in _windows)
             {
-                toFlush ??= [];
-                toFlush.Add(key);
+                if (_publishedWindows.Contains(key))
+                {
+                    keysToRemove ??= new();
+                    keysToRemove.Add(key);
+                    continue;
+                }
+
+                if (now < key.WindowEndUtc + graceSpan)
+                    continue;
+
+                _publishedWindows.Add(key);
+                keysToRemove ??= new();
+                keysToRemove.Add(key);
+
+                toPublish ??= new();
+                toPublish.Add((key, state));
+            }
+
+            if (keysToRemove is not null)
+            {
+                foreach (var key in keysToRemove)
+                    _windows.Remove(key);
             }
         }
 
-        if (toFlush is null) return;
+        if (toPublish is null) return;
 
-        foreach (var key in toFlush)
+        foreach (var (key, state) in toPublish)
         {
-            if (!windows.TryGetValue(key, out var aggregate))
-                continue;
-
+            var avg = state.Count == 0 ? 0 : state.Sum / state.Count;
             var result = new AggregateResultMessage(
                 Topics.SchemaVersion,
                 key.RunId,
@@ -321,11 +248,11 @@ public sealed class Worker(
                 key.DeviceId,
                 key.WindowStartUtc,
                 key.WindowEndUtc,
-                aggregate.Count,
-                aggregate.Sum,
-                aggregate.Min,
-                aggregate.Max,
-                aggregate.Avg,
+                state.Count,
+                state.Sum,
+                state.Min,
+                state.Max,
+                avg,
                 WindowMath.ResultId(key),
                 DateTimeOffset.UtcNow);
 
@@ -334,64 +261,95 @@ public sealed class Worker(
             var message = new MqttApplicationMessageBuilder()
                 .WithTopic(topic)
                 .WithPayload(json)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce)
                 .Build();
 
-            // Only mark as published after successful enqueue
             try
             {
                 await resultWriter.WriteAsync(message, ct);
-                publishedWindows.Add(key);
-                windows.Remove(key);
             }
             catch (OperationCanceledException)
             {
-                break; // Shutting down; leave unpublished windows for possible retry
+                return;
             }
         }
     }
 
-    private async Task ReconnectSubscribeClient(IMqttClient client, MqttOptions mqtt, string wildcardTopic, CancellationToken cancellationToken)
+    private async Task ReconnectSubscriber(IMqttClient client, string host, int port, string topic, string teamId, CancellationToken ct)
     {
-        var baseDelayMs = 100;
-        var maxDelayMs = 5000;
         var attempt = 0;
-
-        while (!cancellationToken.IsCancellationRequested)
+        while (!ct.IsCancellationRequested)
         {
             try
             {
-                var jitter = Random.Shared.Next(0, 100);
-                var delayMs = Math.Min(baseDelayMs * (1 << attempt), maxDelayMs) + jitter;
-                await Task.Delay(delayMs, cancellationToken);
+                var delay = Math.Min(50 * (1 << attempt), 3000) + Random.Shared.Next(0, 50);
+                await Task.Delay(delay, ct);
 
                 var options = new MqttClientOptionsBuilder()
-                    .WithClientId($"processor-{challengeOptions.Value.TeamId}")
-                    .WithTcpServer(mqtt.Host, mqtt.Port)
+                    .WithClientId($"processor-{teamId}")
+                    .WithTcpServer(host, port)
                     .WithCleanStart()
                     .Build();
 
-                await client.ConnectAsync(options, cancellationToken);
+                await client.ConnectAsync(options, ct);
+                await client.SubscribeAsync(
+                    new MqttClientSubscribeOptionsBuilder()
+                        .WithTopicFilter(f => f
+                            .WithTopic(topic)
+                            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
+                        .Build(), ct);
 
-                var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-                    .WithTopicFilter(filter => filter
-                        .WithTopic(wildcardTopic)
-                        .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
-                    .Build();
-
-                await client.SubscribeAsync(subscribeOptions, cancellationToken);
-                logger.LogInformation("Subscribe client reconnected after {Attempts} attempts", attempt + 1);
+                logger.LogInformation("Subscriber reconnected after {Attempts} attempts", attempt + 1);
                 return;
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch { attempt++; }
+        }
+    }
+
+    /// <summary>
+    /// Resolves the Mosquitto Docker container's IP to bypass port-forward NAT.
+    /// Falls back to the configured host if Docker inspection fails.
+    /// </summary>
+    private async Task<string> ResolveMosquittoContainerIp(string fallbackHost)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo("docker", "inspect --format={{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}} $(docker ps --filter ancestor=eclipse-mosquitto:2.0 -q)")
             {
-                return;
-            }
-            catch (Exception ex)
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                FileName = "/bin/bash",
+                Arguments = "-c \"docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps --filter ancestor=eclipse-mosquitto:2.0 -q | head -1)\""
+            };
+
+            using var proc = Process.Start(psi);
+            if (proc is null) return fallbackHost;
+
+            var output = await proc.StandardOutput.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+
+            var ip = output.Trim();
+            if (proc.ExitCode == 0 && !string.IsNullOrEmpty(ip) && ip.Contains('.'))
             {
-                attempt++;
-                logger.LogDebug(ex, "Subscribe client reconnect attempt {Attempt} failed", attempt);
+                logger.LogInformation("Resolved Mosquitto container IP: {IP} (bypassing NAT)", ip);
+                return ip;
             }
         }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Failed to resolve Mosquitto container IP, using fallback");
+        }
+
+        return fallbackHost;
+    }
+
+    private sealed class WindowState
+    {
+        public int Count;
+        public double Sum;
+        public double Min = double.PositiveInfinity;
+        public double Max = double.NegativeInfinity;
     }
 }
