@@ -6,10 +6,6 @@ using TeamActivity.Shared.Contracts;
 
 namespace TeamActivity.Processor;
 
-/// <summary>
-/// Manages a pool of MQTT connections for publishing aggregate results.
-/// Drain loops read from a shared channel and publish via round-robin connections.
-/// </summary>
 public sealed class ResultPublishPool : IAsyncDisposable
 {
     private static readonly Counter<long> ResultsPublished =
@@ -82,10 +78,6 @@ public sealed class ResultPublishPool : IAsyncDisposable
         _logger.LogInformation("All {Count} result publish connections established", _connectionCount);
     }
 
-    /// <summary>
-    /// Starts drain loops that read from the shared result channel and publish.
-    /// Returns tasks for all drain loops.
-    /// </summary>
     public Task[] StartDrainLoops(ChannelReader<MqttApplicationMessage> reader, CancellationToken cancellationToken)
     {
         var tasks = new Task[_connectionCount];

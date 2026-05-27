@@ -1,7 +1,5 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
+using System.Buffers;
 using System.Diagnostics.Metrics;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
@@ -20,7 +18,6 @@ public sealed class Worker(
     private static readonly Counter<long> TelemetryConsumed =
         TelemetryMeters.Processor.CreateCounter<long>("telemetry_consumed_total");
 
-    // Aggregation state — protected by _gate lock
     private readonly object _gate = new();
     private readonly Dictionary<WindowKey, WindowState> _windows = new();
     private readonly HashSet<WindowKey> _publishedWindows = new();
@@ -30,21 +27,20 @@ public sealed class Worker(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var buildTime = File.GetLastWriteTimeUtc(typeof(Worker).Assembly.Location);
-        logger.LogInformation("Processor started. Build={BuildTime:yyyy-MM-dd HH:mm:ss}Z, PID={PID}",
-            buildTime, Environment.ProcessId);
-
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
         var procOpts = processorOptions.Value;
         var wildcardTopic = Topics.TelemetryRawWildcard(challenge.TeamId);
 
-        // Resolve Mosquitto's container IP to bypass Docker NAT port-forwarding
-        var mqttHost = await ResolveMosquittoContainerIp(mqtt.Host);
-        var mqttPort = mqttHost != mqtt.Host ? 1883 : mqtt.Port;
-        logger.LogInformation("Using MQTT broker at {Host}:{Port}", mqttHost, mqttPort);
+        var ingestChannel = Channel.CreateBounded<ReadOnlyMemory<byte>>(
+            new BoundedChannelOptions(200_000)
+            {
+                SingleWriter = true,
+                SingleReader = true,
+                AllowSynchronousContinuations = true,
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
 
-        // Result publish channel
         var resultChannel = Channel.CreateBounded<MqttApplicationMessage>(
             new BoundedChannelOptions(procOpts.PublishChannelCapacity)
             {
@@ -54,38 +50,38 @@ public sealed class Worker(
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        // Set up publish pool with many connections (reduces per-connection batch latency)
         await using var publishPool = new ResultPublishPool(
-            procOpts.PublishConnectionCount, mqttHost, mqttPort, challenge.TeamId, logger);
+            procOpts.PublishConnectionCount, mqtt.Host, mqtt.Port, challenge.TeamId, logger);
         await publishPool.ConnectAllAsync(stoppingToken);
         var drainTasks = publishPool.StartDrainLoops(resultChannel.Reader, stoppingToken);
 
-        // Single subscriber client
+        var processingTask = Task.Run(() => ProcessIngestChannel(ingestChannel.Reader, challenge, stoppingToken), stoppingToken);
+
         var factory = new MqttClientFactory();
         using var subClient = factory.CreateMqttClient();
 
         subClient.ApplicationMessageReceivedAsync += args =>
         {
-            HandleIncoming(args.ApplicationMessage, challenge);
+            var payload = args.ApplicationMessage.Payload;
+            ingestChannel.Writer.TryWrite(payload.IsSingleSegment
+                ? payload.First
+                : new ReadOnlyMemory<byte>(payload.ToArray()));
             return Task.CompletedTask;
         };
 
         subClient.DisconnectedAsync += async args =>
         {
             if (stoppingToken.IsCancellationRequested) return;
-            logger.LogWarning(
-                "Subscriber disconnected: Reason={Reason}, ClientWasConnected={WasConnected}, ReasonString={ReasonString}, Exception={ExType} {ExMsg}",
-                args.Reason, args.ClientWasConnected,
-                args.ReasonString ?? "(null)",
-                args.Exception?.GetType().Name ?? "(none)",
-                args.Exception?.Message ?? "");
-            await ReconnectSubscriber(subClient, mqttHost, mqttPort, wildcardTopic, challenge.TeamId, stoppingToken);
+            logger.LogWarning("Subscriber disconnected: {Reason}", args.Reason);
+            await ReconnectSubscriber(subClient, mqtt.Host, mqtt.Port, wildcardTopic, challenge.TeamId, stoppingToken);
         };
 
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"processor-{challenge.TeamId}")
-            .WithTcpServer(mqttHost, mqttPort)
-            .WithCleanStart()
+            .WithTcpServer(mqtt.Host, mqtt.Port)
+            .WithProtocolVersion(MQTTnet.Formatter.MqttProtocolVersion.V311)
+            .WithCleanSession()
+            .WithKeepAlivePeriod(TimeSpan.FromSeconds(60))
             .Build();
 
         await subClient.ConnectAsync(options, stoppingToken);
@@ -96,9 +92,8 @@ public sealed class Worker(
                     .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtMostOnce))
                 .Build(), stoppingToken);
 
-        logger.LogInformation("Processor subscribed (single client) to {Topic}", wildcardTopic);
+        logger.LogInformation("Processor subscribed to {Topic}", wildcardTopic);
 
-        // Flush loop
         var flushTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(procOpts.FlushCheckIntervalMs));
         var flushTask = Task.Run(async () =>
         {
@@ -120,8 +115,8 @@ public sealed class Worker(
         catch (OperationCanceledException) { }
 
         logger.LogInformation("Processor shutting down. Consumed {Count} messages", _consumedCount);
-
-        // Final flush
+        ingestChannel.Writer.Complete();
+        await processingTask.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         await FlushDueWindows(resultChannel.Writer, challenge, windowGraceMs: 0, stoppingToken);
 
         resultChannel.Writer.Complete();
@@ -130,16 +125,20 @@ public sealed class Worker(
         await flushTask.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
     }
 
-    /// <summary>
-    /// Fast inline message handler — called sequentially from MQTTnet receive loop.
-    /// Synchronized with FlushLoop via _gate lock.
-    /// </summary>
-    private void HandleIncoming(MqttApplicationMessage message, ChallengeOptions challenge)
+    private async Task ProcessIngestChannel(ChannelReader<ReadOnlyMemory<byte>> reader, ChallengeOptions challenge, CancellationToken ct)
+    {
+        await foreach (var payload in reader.ReadAllAsync(ct))
+        {
+            HandleIncoming(payload, challenge);
+        }
+    }
+
+    private void HandleIncoming(ReadOnlyMemory<byte> payload, ChallengeOptions challenge)
     {
         TelemetryMessage? telemetry;
         try
         {
-            var reader = new Utf8JsonReader(message.Payload);
+            var reader = new Utf8JsonReader(payload.Span);
             telemetry = JsonSerializer.Deserialize<TelemetryMessage>(ref reader, JsonContract.Options);
         }
         catch (JsonException)
@@ -153,12 +152,11 @@ public sealed class Worker(
         if (telemetry.TeamId != challenge.TeamId)
             return;
 
-        _consumedCount++;
+        Interlocked.Increment(ref _consumedCount);
         TelemetryConsumed.Add(1);
 
         lock (_gate)
         {
-            // Handle run change
             if (_currentRunId is not null && _currentRunId != telemetry.RunId)
             {
                 _windows.Clear();
@@ -171,17 +169,14 @@ public sealed class Worker(
                 _currentRunId = telemetry.RunId;
             }
 
-            // Dedup by sequence
             if (!_dedupSet.Add(telemetry.Sequence))
                 return;
 
             var windowKey = WindowMath.Assign(telemetry, challenge.WindowSeconds);
 
-            // Skip if already published
             if (_publishedWindows.Contains(windowKey))
                 return;
 
-            // Get or create window state and aggregate
             if (!_windows.TryGetValue(windowKey, out var state))
             {
                 state = new WindowState();
@@ -195,7 +190,7 @@ public sealed class Worker(
         }
     }
 
-    private async ValueTask FlushDueWindows(
+    private async ValueTask<int> FlushDueWindows(
         ChannelWriter<MqttApplicationMessage> resultWriter,
         ChallengeOptions challenge,
         int windowGraceMs,
@@ -236,7 +231,7 @@ public sealed class Worker(
             }
         }
 
-        if (toPublish is null) return;
+        if (toPublish is null) return 0;
 
         foreach (var (key, state) in toPublish)
         {
@@ -270,9 +265,10 @@ public sealed class Worker(
             }
             catch (OperationCanceledException)
             {
-                return;
+                return toPublish.Count;
             }
         }
+        return toPublish.Count;
     }
 
     private async Task ReconnectSubscriber(IMqttClient client, string host, int port, string topic, string teamId, CancellationToken ct)
@@ -288,7 +284,9 @@ public sealed class Worker(
                 var options = new MqttClientOptionsBuilder()
                     .WithClientId($"processor-{teamId}")
                     .WithTcpServer(host, port)
-                    .WithCleanStart()
+                    .WithProtocolVersion(MQTTnet.Formatter.MqttProtocolVersion.V311)
+                    .WithCleanSession()
+                    .WithKeepAlivePeriod(TimeSpan.FromSeconds(60))
                     .Build();
 
                 await client.ConnectAsync(options, ct);
@@ -305,44 +303,6 @@ public sealed class Worker(
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch { attempt++; }
         }
-    }
-
-    /// <summary>
-    /// Resolves the Mosquitto Docker container's IP to bypass port-forward NAT.
-    /// Falls back to the configured host if Docker inspection fails.
-    /// </summary>
-    private async Task<string> ResolveMosquittoContainerIp(string fallbackHost)
-    {
-        try
-        {
-            var psi = new ProcessStartInfo("docker", "inspect --format={{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}} $(docker ps --filter ancestor=eclipse-mosquitto:2.0 -q)")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                FileName = "/bin/bash",
-                Arguments = "-c \"docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker ps --filter ancestor=eclipse-mosquitto:2.0 -q | head -1)\""
-            };
-
-            using var proc = Process.Start(psi);
-            if (proc is null) return fallbackHost;
-
-            var output = await proc.StandardOutput.ReadToEndAsync();
-            await proc.WaitForExitAsync();
-
-            var ip = output.Trim();
-            if (proc.ExitCode == 0 && !string.IsNullOrEmpty(ip) && ip.Contains('.'))
-            {
-                logger.LogInformation("Resolved Mosquitto container IP: {IP} (bypassing NAT)", ip);
-                return ip;
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "Failed to resolve Mosquitto container IP, using fallback");
-        }
-
-        return fallbackHost;
     }
 
     private sealed class WindowState

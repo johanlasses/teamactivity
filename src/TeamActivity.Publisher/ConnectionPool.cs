@@ -10,10 +10,6 @@ using TeamActivity.Shared.Contracts;
 
 namespace TeamActivity.Publisher;
 
-/// <summary>
-/// Manages a pool of MQTT connections for high-throughput telemetry publishing.
-/// Each connection drains assigned shards (shard % ConnectionCount == connectionIndex).
-/// </summary>
 public sealed class ConnectionPool : IAsyncDisposable
 {
     private static readonly JsonEncodedText SchemaVersionProperty = JsonEncodedText.Encode("schemaVersion");
@@ -64,15 +60,8 @@ public sealed class ConnectionPool : IAsyncDisposable
             client.DisconnectedAsync += async args =>
             {
                 if (cancellationToken.IsCancellationRequested) return;
-
                 ReconnectsTotal.Add(1, new KeyValuePair<string, object?>("connection", index));
-                _logger.LogWarning(
-                    "Pool connection {Index} disconnected: Reason={Reason}, ClientWasConnected={WasConnected}, ReasonString={ReasonString}, Exception={ExType} {ExMsg}",
-                    index, args.Reason, args.ClientWasConnected,
-                    args.ReasonString ?? "(null)",
-                    args.Exception?.GetType().Name ?? "(none)",
-                    args.Exception?.Message ?? "");
-
+                _logger.LogWarning("Pool connection {Index} disconnected: {Reason}", index, args.Reason);
                 await ReconnectWithBackoff(client, index, cancellationToken);
             };
 
@@ -85,17 +74,12 @@ public sealed class ConnectionPool : IAsyncDisposable
                 .Build();
 
             connectTasks[i] = client.ConnectAsync(options, cancellationToken);
-            _logger.LogInformation("Pool connection {Index} connecting with ClientId={ClientId}, Protocol=V311", index, clientId);
         }
 
         await Task.WhenAll(connectTasks);
-        _logger.LogInformation("All {Count} pool connections established (Protocol=V311)", _connectionCount);
+        _logger.LogInformation("All {Count} pool connections established", _connectionCount);
     }
 
-    /// <summary>
-    /// Starts drain loops. Each shard is drained by connection[shard % ConnectionCount].
-    /// Returns tasks for all drain loops (one per shard).
-    /// </summary>
     public Task[] StartDrainLoops(Channel<TelemetryEnvelope>[] shards, string telemetryTopic, CancellationToken cancellationToken)
     {
         var tasks = new Task[shards.Length];
