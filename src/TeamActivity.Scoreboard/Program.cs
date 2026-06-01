@@ -860,6 +860,7 @@ internal static class ScoreboardPage
           feedback.className = 'success';
           feedback.textContent = 'Run stopped.';
           stopTimer();
+          updateRunStatusBadge('idle');
         } else {
           feedback.className = 'error';
           feedback.textContent = 'Stop failed: ' + res.status;

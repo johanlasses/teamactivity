@@ -96,13 +96,15 @@ app.MapPost("/api/run/start", (RunStartRequest req, RunTriggerStore triggers, Ch
     return Results.Ok(config);
 });
 
-app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker) =>
+app.MapPost("/api/run/stop", (RunTriggerStore triggers, ChaosStore chaos, ChaosScheduleTracker scheduleTracker, RunAnnouncer announcer) =>
 {
     var status = triggers.GetStatus();
     var runId = status.Config?.RunId;
     var cancelled = triggers.TryCancel();
     chaos.Disable();
     if (runId is not null) scheduleTracker.Cancel(runId);
+    if (cancelled && runId is not null)
+        announcer.Announce(Topics.RunAbort, runId);
     return cancelled ? Results.Ok() : Results.Conflict("No run in progress.");
 });
 

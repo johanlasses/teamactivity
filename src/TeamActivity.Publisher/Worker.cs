@@ -19,6 +19,9 @@ public sealed class Worker(
     private static readonly Counter<long> TelemetryPublished = TelemetryMeters.Publisher.CreateCounter<long>("telemetry_published_total");
     private static readonly Counter<long> ControlPublished = TelemetryMeters.Publisher.CreateCounter<long>("control_published_total");
 
+    private CancellationTokenSource? _runCts;
+    private readonly Lock _runCtsGate = new();
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var startupDelay = TimeSpan.FromSeconds(Math.Max(0, publisherOptions.Value.StartupDelaySeconds));
@@ -51,6 +54,10 @@ public sealed class Worker(
                 if (trigger is not null)
                     triggerChannel.Writer.TryWrite(trigger);
             }
+            else if (args.ApplicationMessage.Topic == Topics.RunAbort)
+            {
+                lock (_runCtsGate) { _runCts?.Cancel(); }
+            }
             return Task.CompletedTask;
         };
         // ─────────────────────────────────────────────────────────────────────────
@@ -68,6 +75,9 @@ public sealed class Worker(
             .WithTopicFilter(filter => filter
                 .WithTopic(Topics.RunTrigger)
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
+            .WithTopicFilter(filter => filter
+                .WithTopic(Topics.RunAbort)
+                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
             .Build();
 
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
@@ -79,7 +89,17 @@ public sealed class Worker(
                 "Received run trigger: RunId={RunId}, DeviceCount={DeviceCount}, IntervalMs={IntervalMs}, RunWindowSeconds={RunWindowSeconds}",
                 trigger.RunId, trigger.DeviceCount, trigger.IntervalMs, trigger.RunWindowSeconds);
 
-            await ExecuteRun(client, trigger, challenge, stoppingToken);
+            var runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            lock (_runCtsGate) { _runCts = runCts; }
+            try
+            {
+                await ExecuteRun(client, trigger, challenge, runCts.Token, stoppingToken);
+            }
+            finally
+            {
+                lock (_runCtsGate) { _runCts = null; }
+                runCts.Dispose();
+            }
 
             logger.LogInformation("Run {RunId} complete — returning to idle.", trigger.RunId);
         }
@@ -89,6 +109,7 @@ public sealed class Worker(
         IMqttClient client,
         RunTriggerMessage trigger,
         ChallengeOptions challenge,
+        CancellationToken runToken,
         CancellationToken stoppingToken)
     {
         ActivityContext parentContext = default;
@@ -132,8 +153,20 @@ public sealed class Worker(
             var delay = scheduledAtUtc - DateTimeOffset.UtcNow;
             if (delay > TimeSpan.Zero)
             {
-                await Task.Delay(delay, stoppingToken);
+                try
+                {
+                    await Task.Delay(delay, runToken);
+                }
+                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+                {
+                    // Run was aborted via stop signal — exit the emission loop early.
+                    logger.LogInformation("Run {RunId} aborted — stopping emission early at index {Index}.", runId, emissionIndex);
+                    break;
+                }
             }
+
+            if (runToken.IsCancellationRequested)
+                break;
 
             if (DateTimeOffset.UtcNow >= runEndsAtUtc)
             {
