@@ -58,6 +58,33 @@ Keep all MQTT topic patterns and JSON field names exactly as defined — any dev
 
 ---
 
+## Setup
+
+**Prerequisites:** [.NET 10 SDK](https://dotnet.microsoft.com/download) · [Docker Desktop](https://www.docker.com/products/docker-desktop/) · [Aspire CLI](https://aspire.dev/get-started/install-cli/)
+
+```bash
+git clone https://github.com/johanlasses/teamactivity.git
+```
+
+**Set your team ID** in `src/TeamActivity.Publisher/appsettings.json` so your results appear on the Scoreboard:
+
+```json
+"teamId": "your-team-name"
+```
+
+**Start:**
+```bash
+aspire start
+```
+The Aspire dashboard URL is printed in the terminal. Open it to inspect logs, traces, and metrics.
+
+**Stop:**
+```bash
+aspire stop
+```
+
+---
+
 ## Starting a Run
 
 Open the **Scoreboard** in your browser after starting Aspire — runs do **not** start automatically.
@@ -102,33 +129,6 @@ Publisher ──► MQTT broker ──► Processor ──► MQTT broker ──
 | **Judge** | Validates and scores results — do not modify |
 | **Scoreboard** | Live leaderboard — do not modify |
 | **Aspire Dashboard** | Logs, traces, and metrics for your pipeline |
-
----
-
-## Setup
-
-**Prerequisites:** [.NET 10 SDK](https://dotnet.microsoft.com/download) · [Docker Desktop](https://www.docker.com/products/docker-desktop/) · [Aspire CLI](https://aspire.dev/get-started/install-cli/)
-
-```bash
-git clone https://github.com/johanlasses/teamactivity.git
-```
-
-**Set your team ID** in `src/TeamActivity.Publisher/appsettings.json` so your results appear on the Scoreboard:
-
-```json
-"teamId": "your-team-name"
-```
-
-**Start:**
-```bash
-aspire start
-```
-The Aspire dashboard URL is printed in the terminal. Open it to inspect logs, traces, and metrics.
-
-**Stop:**
-```bash
-aspire stop
-```
 
 ---
 
