@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using MQTTnet;
 using MQTTnet.Protocol;
@@ -25,6 +26,13 @@ public sealed class JudgeWorker(
     private static readonly Counter<long> ResultsReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_results_received_total");
     private static readonly Counter<long> ControlReceived = TelemetryMeters.Judge.CreateCounter<long>("judge_control_received_total");
 
+    // Unbounded so no messages are ever dropped — scoring correctness takes priority.
+    // SingleWriter=false because TryWrite may race with shutdown; SingleReader=true
+    // because only ProcessMessagesAsync reads.
+    private readonly Channel<(string Topic, string Payload, DateTimeOffset ReceivedAt)> _messageChannel =
+        Channel.CreateUnbounded<(string, string, DateTimeOffset)>(
+            new UnboundedChannelOptions { SingleReader = true });
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var mqtt = mqttOptions.Value;
@@ -32,9 +40,14 @@ public sealed class JudgeWorker(
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
 
+        // Enqueue onto the channel immediately and return — keeps the MQTT receive loop
+        // unblocked while processing happens on a dedicated consumer task.
         client.ApplicationMessageReceivedAsync += args =>
         {
-            HandleMessage(args.ApplicationMessage.Topic, Encoding.UTF8.GetString(args.ApplicationMessage.Payload), DateTimeOffset.UtcNow);
+            _messageChannel.Writer.TryWrite((
+                args.ApplicationMessage.Topic,
+                Encoding.UTF8.GetString(args.ApplicationMessage.Payload),
+                DateTimeOffset.UtcNow));
             return Task.CompletedTask;
         };
 
@@ -63,6 +76,7 @@ public sealed class JudgeWorker(
         logger.LogInformation("Judge subscribed to telemetry, result, and control topics.");
 
         var drainTask = DrainAnnouncementsAsync(client, stoppingToken);
+        var processTask = ProcessMessagesAsync(stoppingToken);
 
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         while (await timer.WaitForNextTickAsync(stoppingToken))
@@ -70,7 +84,16 @@ public sealed class JudgeWorker(
             scoring.FinalizeDueWindows(challengeOptions.Value.GraceSeconds);
         }
 
-        await drainTask;
+        _messageChannel.Writer.TryComplete();
+        await Task.WhenAll(drainTask, processTask);
+    }
+
+    private async Task ProcessMessagesAsync(CancellationToken stoppingToken)
+    {
+        await foreach (var (topic, payload, receivedAt) in _messageChannel.Reader.ReadAllAsync(stoppingToken))
+        {
+            HandleMessage(topic, payload, receivedAt);
+        }
     }
 
     private async Task DrainAnnouncementsAsync(IMqttClient client, CancellationToken stoppingToken)

@@ -7,7 +7,7 @@ public sealed class ObservedRunStore
     private const int MaxMessagesPerRun = 500;
 
     private readonly object gate = new();
-    private readonly Dictionary<string, List<ObservedMessage>> messagesByRun = [];
+    private readonly Dictionary<string, Queue<ObservedMessage>> messagesByRun = [];
     private readonly Dictionary<string, string> runNames = [];
     private readonly Dictionary<string, RunTrafficState> runTrafficByRun = [];
 
@@ -31,15 +31,14 @@ public sealed class ObservedRunStore
         {
             if (!messagesByRun.TryGetValue(message.RunId, out var messages))
             {
-                messages = [];
+                messages = new Queue<ObservedMessage>();
                 messagesByRun.Add(message.RunId, messages);
             }
 
-            messages.Add(message);
-            if (messages.Count > MaxMessagesPerRun)
-            {
-                messages.RemoveRange(0, messages.Count - MaxMessagesPerRun);
-            }
+            messages.Enqueue(message);
+            // O(1) dequeue from the front — no element shifting compared to List.RemoveRange.
+            while (messages.Count > MaxMessagesPerRun)
+                messages.Dequeue();
 
             var traffic = GetOrCreateTraffic(message.RunId);
             traffic.TeamIds.Add(message.TeamId);
@@ -106,7 +105,7 @@ public sealed class ObservedRunStore
         lock (gate)
         {
             return messagesByRun.TryGetValue(runId, out var messages)
-                ? messages.OrderBy(message => message.ReceivedAtUtc).ToArray()
+                ? messages.ToArray()
                 : [];
         }
     }

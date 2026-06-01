@@ -3,16 +3,17 @@ namespace TeamActivity.Judge;
 public sealed class ChaosMessageBuffer
 {
     private readonly object gate = new();
-    private readonly List<(string Topic, string Payload, DateTimeOffset ReceivedAt)> buffer = [];
+    private readonly Queue<(string Topic, string Payload, DateTimeOffset ReceivedAt)> buffer = new();
 
     public void Add(string topic, string payload)
     {
         lock (gate)
         {
-            buffer.Add((topic, payload, DateTimeOffset.UtcNow));
-            // Trim entries older than 30s to keep memory bounded
+            buffer.Enqueue((topic, payload, DateTimeOffset.UtcNow));
+            // Trim entries older than 30s from the front — O(k) dequeues instead of O(n) RemoveAll.
             var cutoff = DateTimeOffset.UtcNow.AddSeconds(-30);
-            buffer.RemoveAll(m => m.ReceivedAt < cutoff);
+            while (buffer.Count > 0 && buffer.Peek().ReceivedAt < cutoff)
+                buffer.Dequeue();
         }
     }
 

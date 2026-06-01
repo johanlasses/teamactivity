@@ -132,17 +132,14 @@ public sealed class ScoringStore
 
         lock (gate)
         {
+            // Pass 1: finalise due expected windows. Collect keys first, then remove to
+            // avoid modifying the dictionaries while iterating them.
+            List<WindowKey>? dueExpected = null;
+
             foreach (var (key, expected) in expectedWindows)
             {
-                if (finalizedWindows.Contains(key))
-                {
-                    continue;
-                }
-
                 if (now < key.WindowEndUtc.AddSeconds(graceSeconds).Add(FinalizationSlack))
-                {
                     continue;
-                }
 
                 var score = TouchScore(key.RunId, key.TeamId);
                 var observedCount = expected.Aggregate.Count;
@@ -151,51 +148,69 @@ public sealed class ScoringStore
                 if (observedCount != theoreticalCount)
                 {
                     score.PublisherMismatchWindowCount++;
-                    finalizedWindows.Add(key);
-                    score.LastUpdatedUtc = now;
-                    continue;
-                }
-
-                score.FullyObservedWindowCount++;
-
-                if (resultCandidates.TryGetValue(key, out var candidate) && expected.Aggregate.Matches(candidate.Result))
-                {
-                    score.Correct++;
-                    Correct.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-                    score.LatenciesMs.Add(Math.Max(0, (candidate.ReceivedAtUtc - key.WindowEndUtc).TotalMilliseconds));
-                }
-                else if (resultCandidates.ContainsKey(key))
-                {
-                    score.Invalid++;
-                    Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
                 }
                 else
                 {
-                    score.Missing++;
-                    Missing.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
+                    score.FullyObservedWindowCount++;
+
+                    if (resultCandidates.TryGetValue(key, out var candidate) && expected.Aggregate.Matches(candidate.Result))
+                    {
+                        score.Correct++;
+                        Correct.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
+                        score.AddLatency(Math.Max(0, (candidate.ReceivedAtUtc - key.WindowEndUtc).TotalMilliseconds));
+                    }
+                    else if (resultCandidates.ContainsKey(key))
+                    {
+                        score.Invalid++;
+                        Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
+                    }
+                    else
+                    {
+                        score.Missing++;
+                        Missing.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
+                    }
                 }
 
-                finalizedWindows.Add(key);
                 score.LastUpdatedUtc = now;
+                finalizedWindows.Add(key);
+                (dueExpected ??= []).Add(key);
             }
+
+            // Prune finalised entries from both source dictionaries so the next tick
+            // iterates only active (un-finalised) windows — O(active) instead of O(all-time).
+            if (dueExpected is not null)
+            {
+                foreach (var key in dueExpected)
+                {
+                    expectedWindows.Remove(key);
+                    resultCandidates.Remove(key);
+                }
+            }
+
+            // Pass 2: mark orphan result candidates (no expected window) as invalid once
+            // they are past the grace period. Finalized candidates were already removed above.
+            List<WindowKey>? orphanCandidates = null;
 
             foreach (var (key, candidate) in resultCandidates)
             {
-                if (expectedWindows.ContainsKey(key) || finalizedWindows.Contains(key))
-                {
+                if (expectedWindows.ContainsKey(key))
                     continue;
-                }
 
                 if (now - candidate.ReceivedAtUtc < TimeSpan.FromSeconds(graceSeconds))
-                {
                     continue;
-                }
 
                 var score = TouchScore(key.RunId, key.TeamId);
                 score.Invalid++;
                 Invalid.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
                 finalizedWindows.Add(key);
                 score.LastUpdatedUtc = now;
+                (orphanCandidates ??= []).Add(key);
+            }
+
+            if (orphanCandidates is not null)
+            {
+                foreach (var key in orphanCandidates)
+                    resultCandidates.Remove(key);
             }
         }
     }
@@ -308,16 +323,16 @@ public sealed class ScoringStore
             latencyScore);
     }
 
-    private static double CalculateP95(IReadOnlyCollection<double> values)
+    private static double CalculateP95(IReadOnlyList<double> values)
     {
         if (values.Count == 0)
         {
             return 0;
         }
 
-        var ordered = values.Order().ToArray();
-        var index = (int)Math.Ceiling(ordered.Length * 0.95) - 1;
-        return ordered[Math.Clamp(index, 0, ordered.Length - 1)];
+        // List is kept sorted by AddLatency — read the P95 index directly, no sort needed.
+        var index = (int)Math.Ceiling(values.Count * 0.95) - 1;
+        return values[Math.Clamp(index, 0, values.Count - 1)];
     }
 
     private sealed class ExpectedWindow
@@ -336,7 +351,9 @@ public sealed class ScoringStore
         DateTimeOffset RunStartedAtUtc,
         int WindowSeconds)
     {
-        public int ExpectedWindowCount =>
+        // Computed once at construction — BuildWindowExpectations is O(num_windows) so
+        // we must not call it on every GetScores poll.
+        public int ExpectedWindowCount { get; } =
             RunMath.BuildWindowExpectations(RunStartedAtUtc, RunWindowSeconds, MessageIntervalMs, WindowSeconds).Count * DeviceCount;
     }
 
@@ -354,7 +371,15 @@ public sealed class ScoringStore
 
         public int PublisherMismatchWindowCount { get; set; }
 
-        public List<double> LatenciesMs { get; } = [];
+        // Maintained in sorted order so P95 is a direct index read — no sort allocation per poll.
+        private readonly List<double> _latenciesMs = [];
+        public IReadOnlyList<double> LatenciesMs => _latenciesMs;
+
+        public void AddLatency(double ms)
+        {
+            var idx = _latenciesMs.BinarySearch(ms);
+            _latenciesMs.Insert(idx < 0 ? ~idx : idx, ms);
+        }
 
         public DateTimeOffset LastUpdatedUtc { get; set; } = DateTimeOffset.UtcNow;
     }
