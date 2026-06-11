@@ -65,11 +65,8 @@ public sealed class Worker(
         var options = new MqttClientOptionsBuilder()
             .WithClientId($"publisher-{challenge.TeamId}")
             .WithTcpServer(mqtt.Host, mqtt.Port)
-            .WithCleanStart()
+            .WithCleanStart(false)
             .Build();
-
-        logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
-        await client.ConnectAsync(options, stoppingToken);
 
         var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
             .WithTopicFilter(filter => filter
@@ -79,6 +76,75 @@ public sealed class Worker(
                 .WithTopic(Topics.RunAbort)
                 .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
             .Build();
+
+        // Reconnect handler: when disconnected, attempt to reconnect with exponential back-off.
+        client.DisconnectedAsync += async args =>
+        {
+            if (stoppingToken.IsCancellationRequested)
+                return;
+
+            logger.LogWarning(args.Exception,
+                "Publisher disconnected from MQTT broker (Reason: {Reason}). Attempting reconnect...",
+                args.Reason);
+
+            var delay = TimeSpan.FromSeconds(2);
+            const int maxRetries = 10;
+
+            for (var attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                if (stoppingToken.IsCancellationRequested)
+                    return;
+
+                try
+                {
+                    await Task.Delay(delay, stoppingToken);
+                    await client.ConnectAsync(options, stoppingToken);
+                    await client.SubscribeAsync(subscribeOptions, stoppingToken);
+                    logger.LogInformation("Publisher reconnected to MQTT broker on attempt {Attempt}.", attempt);
+                    return;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Reconnect attempt {Attempt}/{MaxRetries} failed.", attempt, maxRetries);
+                    delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 30));
+                }
+            }
+
+            logger.LogError("Publisher failed to reconnect after {MaxRetries} attempts.", maxRetries);
+        };
+
+        // Initial connection with retry logic for startup resilience.
+        logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
+        {
+            var delay = TimeSpan.FromSeconds(2);
+            const int maxStartupRetries = 10;
+
+            for (var attempt = 1; attempt <= maxStartupRetries; attempt++)
+            {
+                try
+                {
+                    await client.ConnectAsync(options, stoppingToken);
+                    break;
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt == maxStartupRetries)
+                        throw;
+
+                    logger.LogWarning(ex, "Initial MQTT connect attempt {Attempt}/{MaxRetries} failed. Retrying...", attempt, maxStartupRetries);
+                    await Task.Delay(delay, stoppingToken);
+                    delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 30));
+                }
+            }
+        }
 
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
         logger.LogInformation("Publisher connected and idle — waiting for a run trigger via MQTT.");
@@ -207,7 +273,7 @@ public sealed class Worker(
         // ─────────────────────────────────────────────────────────────────────────
     }
 
-    private static Task PublishControl(
+    private Task PublishControl(
         IMqttClient client,
         string runId,
         string teamId,
@@ -233,17 +299,17 @@ public sealed class Worker(
 
         var topic = Topics.Control(runId, teamId, eventName);
         var json = JsonSerializer.Serialize(control, JsonContract.Options);
-        var publishTask = PublishJson(client, topic, json, cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+        var publishTask = PublishJson(client, topic, json, cancellationToken, MqttQualityOfServiceLevel.ExactlyOnce);
         ControlPublished.Add(1, new KeyValuePair<string, object?>("event", eventName));
         return publishTask;
     }
 
-    private static Task PublishJson(
+    private async Task PublishJson(
         IMqttClient client,
         string topic,
         string json,
         CancellationToken cancellationToken,
-        MqttQualityOfServiceLevel qualityOfServiceLevel = MqttQualityOfServiceLevel.AtMostOnce)
+        MqttQualityOfServiceLevel qualityOfServiceLevel = MqttQualityOfServiceLevel.ExactlyOnce)
     {
         var message = new MqttApplicationMessageBuilder()
             .WithTopic(topic)
@@ -251,6 +317,55 @@ public sealed class Worker(
             .WithQualityOfServiceLevel(qualityOfServiceLevel)
             .Build();
 
-        return client.PublishAsync(message, cancellationToken);
+        var delay = TimeSpan.FromMilliseconds(500);
+        const int maxAttempts = 5;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                if (!client.IsConnected)
+                {
+                    logger.LogDebug("Waiting for MQTT reconnection before publish attempt {Attempt}...", attempt);
+                    await WaitForConnectionAsync(client, cancellationToken);
+                }
+
+                await client.PublishAsync(message, cancellationToken);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (attempt == maxAttempts)
+                {
+                    logger.LogError(ex, "Failed to publish to {Topic} after {MaxAttempts} attempts.", topic, maxAttempts);
+                    throw;
+                }
+
+                logger.LogWarning(ex, "Publish attempt {Attempt}/{MaxAttempts} to {Topic} failed. Retrying...", attempt, maxAttempts, topic);
+                await Task.Delay(delay, cancellationToken);
+                delay = TimeSpan.FromMilliseconds(Math.Min(delay.TotalMilliseconds * 2, 5000));
+            }
+        }
+    }
+
+    private static async Task WaitForConnectionAsync(IMqttClient client, CancellationToken cancellationToken)
+    {
+        var timeout = TimeSpan.FromSeconds(30);
+        var elapsed = TimeSpan.Zero;
+        var poll = TimeSpan.FromMilliseconds(250);
+
+        while (!client.IsConnected)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (elapsed >= timeout)
+                throw new InvalidOperationException("Timed out waiting for MQTT reconnection.");
+
+            await Task.Delay(poll, cancellationToken);
+            elapsed += poll;
+        }
     }
 }
