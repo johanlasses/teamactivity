@@ -18,14 +18,13 @@ public sealed class Worker(
 
     private readonly object gate = new();
     private readonly Dictionary<WindowKey, AggregateWindow> windows = [];
-    private readonly HashSet<WindowKey> publishedWindows = [];
+    private readonly HashSet<(string DeviceId, long Sequence)> seenSequences = [];
     private string? currentRunId;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var mqtt = mqttOptions.Value;
         var challenge = challengeOptions.Value;
-        // Subscribe using a wildcard for runId so we receive telemetry regardless of which UUID was assigned by the trigger.
         var wildcardTopic = Topics.TelemetryRawWildcard(challenge.TeamId);
 
         var factory = new MqttClientFactory();
@@ -55,14 +54,11 @@ public sealed class Worker(
         await client.SubscribeAsync(subscribeOptions, stoppingToken);
         logger.LogInformation("Processor subscribed to {Topic}", wildcardTopic);
 
-        // ── IMPROVEMENT OPPORTUNITY ───────────────────────────────────────────────
-        // The timer fires every 500 ms, but windows close every 5 seconds and the
-        // Judge's grace period is only 2 seconds after windowEnd. Publishing sooner
-        // (e.g. immediately when windowEnd passes) improves your latency score.
-        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        // Publish windows as soon as they are due by checking frequently.
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(50));
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
-            await PublishDueWindows(client, challenge, stoppingToken);
+            await PublishDueWindows(client, stoppingToken);
         }
     }
 
@@ -95,19 +91,19 @@ public sealed class Worker(
 
         lock (gate)
         {
-            // ── KEEP THIS ──────────────────────────────────────────────────────────
-            // Resets window state when a new run starts so previous run data doesn't
-            // bleed into the new run's aggregates. If you refactor state management,
-            // make sure this reset still happens when the runId changes.
             if (currentRunId is not null && currentRunId != telemetry.RunId)
             {
                 logger.LogInformation("New runId detected ({NewRunId}), clearing window state from previous run.", telemetry.RunId);
                 windows.Clear();
-                publishedWindows.Clear();
+                seenSequences.Clear();
             }
-            // ───────────────────────────────────────────────────────────────────────
 
             currentRunId = telemetry.RunId;
+
+            if (!seenSequences.Add((telemetry.DeviceId, telemetry.Sequence)))
+            {
+                return;
+            }
 
             if (!windows.TryGetValue(windowKey, out var aggregate))
             {
@@ -116,16 +112,11 @@ public sealed class Worker(
             }
 
             aggregate.Add(telemetry.Value);
-            // ── IMPROVEMENT OPPORTUNITY ───────────────────────────────────────────
-            // The template does not deduplicate readings. During chaos mode, duplicate
-            // messages can be injected. Add dedup here by tracking seen sequences:
-            //   e.g. a HashSet<(string deviceId, long sequence)> per run.
-            // ──────────────────────────────────────────────────────────────────────
             TelemetryConsumed.Add(1, new KeyValuePair<string, object?>("team_id", telemetry.TeamId));
         }
     }
 
-    private async Task PublishDueWindows(IMqttClient client, ChallengeOptions challenge, CancellationToken cancellationToken)
+    private async Task PublishDueWindows(IMqttClient client, CancellationToken cancellationToken)
     {
         var now = DateTimeOffset.UtcNow;
         List<(WindowKey Key, AggregateWindow Aggregate)> due = [];
@@ -134,16 +125,16 @@ public sealed class Worker(
         {
             foreach (var (key, aggregate) in windows)
             {
-                if (publishedWindows.Contains(key))
-                {
-                    continue;
-                }
-
                 if (now >= key.WindowEndUtc)
                 {
-                    publishedWindows.Add(key);
                     due.Add((key, aggregate));
                 }
+            }
+
+            // Remove published windows immediately to keep future scans O(active windows).
+            foreach (var (key, _) in due)
+            {
+                windows.Remove(key);
             }
         }
 
@@ -174,8 +165,9 @@ public sealed class Worker(
 
             await client.PublishAsync(message, cancellationToken);
             ResultsPublished.Add(1, new KeyValuePair<string, object?>("team_id", key.TeamId));
-            logger.LogInformation(
-                "Window reported: Device={DeviceId} [{WindowStart:HH:mm:ss}–{WindowEnd:HH:mm:ss}] Count={Count} Avg={Avg:F2} Min={Min:F2} Max={Max:F2}",
+
+            logger.LogDebug(
+                "Window reported: Device={DeviceId} [{WindowStart:HH:mm:ss}-{WindowEnd:HH:mm:ss}] Count={Count} Avg={Avg:F2} Min={Min:F2} Max={Max:F2}",
                 key.DeviceId,
                 key.WindowStartUtc,
                 key.WindowEndUtc,
