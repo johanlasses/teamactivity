@@ -234,8 +234,8 @@ public sealed class Worker(
         var messagesPerDevice = RunMath.CalculateMessagesPerDevice(activeRun.RunWindowSeconds, activeRun.IntervalMs);
         var theoreticalTotalMessages = RunMath.CalculateTheoreticalTelemetryCount(activeRun.DeviceCount, activeRun.RunWindowSeconds, activeRun.IntervalMs);
         long publishedCount = 0;
-        var deviceIds = Enumerable.Range(1, activeRun.DeviceCount)
-            .Select(deviceNumber => $"device-{deviceNumber:000}")
+        var devices = Enumerable.Range(1, activeRun.DeviceCount)
+            .Select(deviceNumber => new DeviceState($"device-{deviceNumber:000}", 40 + deviceNumber))
             .ToArray();
         var telemetryTopic = Topics.TelemetryRaw(activeRun.RunId, activeRun.TeamId);
         var checkpointEveryEmissions = Math.Max(1, publisherOptions.Value.CheckpointEveryEmissions);
@@ -301,20 +301,18 @@ public sealed class Worker(
                 break;
             }
 
-            foreach (var deviceId in deviceIds)
+            foreach (var device in devices)
             {
-                await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, stoppingToken);
-
                 var publishedAtUtc = DateTimeOffset.UtcNow;
                 var telemetry = new TelemetryMessage(
                     Topics.SchemaVersion,
                     activeRun.RunId,
                     activeRun.TeamId,
-                    deviceId,
+                    device.DeviceId,
                     activeRun.NextSequence++,
                     scheduledAtUtc,
                     publishedAtUtc,
-                    40 + Array.IndexOf(deviceIds, deviceId) + 1 + emissionIndex / 10.0);
+                    device.BaseValue + emissionIndex / 10.0);
 
                 var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
                 await PublishJsonAsync(client, clientOptions, challenge, telemetryTopic, telemetryJson, stoppingToken);
@@ -653,4 +651,6 @@ public sealed class Worker(
             };
         }
     }
+
+    private sealed record DeviceState(string DeviceId, double BaseValue);
 }
