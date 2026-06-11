@@ -244,24 +244,30 @@ public sealed class Worker(
                 break;
             }
 
+            // Publish all devices concurrently for this emission to minimize timing drift.
+            var tasks = new Task[deviceCount];
             for (var deviceNumber = 1; deviceNumber <= deviceCount; deviceNumber++)
             {
+                var deviceSeq = sequence++;
+                var deviceNum = deviceNumber;
                 var publishedAtUtc = DateTimeOffset.UtcNow;
                 var telemetry = new TelemetryMessage(
                     Topics.SchemaVersion,
                     runId,
                     challenge.TeamId,
-                    $"device-{deviceNumber:000}",
-                    sequence++,
+                    $"device-{deviceNum:000}",
+                    deviceSeq,
                     scheduledAtUtc,
                     publishedAtUtc,
-                    40 + deviceNumber + emissionIndex / 10.0);
+                    40 + deviceNum + emissionIndex / 10.0);
 
                 var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
-                await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
-                publishedCount++;
-                TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
+                tasks[deviceNumber - 1] = PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
             }
+
+            await Task.WhenAll(tasks);
+            publishedCount += deviceCount;
+            TelemetryPublished.Add(deviceCount, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
         }
         // ─────────────────────────────────────────────────────────────────────────
 

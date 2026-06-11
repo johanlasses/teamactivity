@@ -19,7 +19,7 @@ public sealed class Worker(
     private readonly object gate = new();
     private readonly Dictionary<WindowKey, AggregateWindow> windows = [];
     private readonly HashSet<WindowKey> publishedWindows = [];
-    private readonly HashSet<(string DeviceId, long Sequence)> seenMessages = [];
+    private readonly HashSet<(string RunId, string DeviceId, long Sequence)> seenMessages = [];
     private string? currentRunId;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -126,7 +126,7 @@ public sealed class Worker(
         // The timer fires every 500 ms, but windows close every 5 seconds and the
         // Judge's grace period is only 2 seconds after windowEnd. Publishing sooner
         // (e.g. immediately when windowEnd passes) improves your latency score.
-        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(50));
         while (await timer.WaitForNextTickAsync(stoppingToken))
         {
             await PublishDueWindows(client, challenge, stoppingToken);
@@ -177,10 +177,18 @@ public sealed class Worker(
 
             currentRunId = telemetry.RunId;
 
-            // Deduplicate: skip messages already processed (same device + sequence).
-            if (!seenMessages.Add((telemetry.DeviceId, telemetry.Sequence)))
+            // Deduplicate: skip messages already processed (same run + device + sequence).
+            if (!seenMessages.Add((telemetry.RunId, telemetry.DeviceId, telemetry.Sequence)))
             {
                 logger.LogDebug("Duplicate telemetry ignored: Device={DeviceId} Sequence={Sequence}", telemetry.DeviceId, telemetry.Sequence);
+                return;
+            }
+
+            // Reject late-arriving messages for windows that have already been published.
+            // Including them would corrupt the average since the result was already sent.
+            if (publishedWindows.Contains(windowKey))
+            {
+                logger.LogDebug("Late telemetry ignored for already-published window: Device={DeviceId} Window={WindowStart}", telemetry.DeviceId, windowKey.WindowStartUtc);
                 return;
             }
 
