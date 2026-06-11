@@ -20,6 +20,21 @@ This repository is a .NET Aspire hackathon template.
 - Do not add custom Polly policies, retries, circuit breakers, or backoff logic.
 - Standard Aspire ServiceDefaults are allowed and expected.
 - Full scoring lives in the Judge.
+- Keep the solution runnable after this step.
+- Make the smallest safe change that improves the current implementation.
+- Do not modify `src/TeamActivity.Judge`, `src/TeamActivity.Scoreboard`, `src/TeamActivity.Shared.Contracts`, `TeamActivity.AppHost`, or `scripts/`.
+- Do not change MQTT topic patterns, JSON field names, schema version, or the raw telemetry QoS contract.
+- Preserve Publisher control messages: `publisher-start` and `publisher-complete`.
+- Do not modify code regions explicitly marked with `// ── KEEP THIS ──────────────────────────────────────────────────────────`. Those blocks are protected even when a broader refactor is requested.
+- Prefer one commit-sized change per step.
+- After changes:
+  1. build the solution,
+  2. report exactly what changed,
+  3. explain why it helps scoring,
+  4. list any remaining risk,
+  5. confirm the app is still runnable.
+- If the requested change is too large for one safe step, split it into smaller steps and do only the first safe one.
+
 
 ## Aspire MCP workflow
 

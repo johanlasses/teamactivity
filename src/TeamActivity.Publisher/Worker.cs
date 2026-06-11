@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -21,10 +22,14 @@ public sealed class Worker(
 
     private CancellationTokenSource? _runCts;
     private readonly Lock _runCtsGate = new();
+    private readonly Lock _stateGate = new();
+    private ActiveRunState? _activeRun;
+    private bool _subscriptionsReady;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var startupDelay = TimeSpan.FromSeconds(Math.Max(0, publisherOptions.Value.StartupDelaySeconds));
+        var options = publisherOptions.Value;
+        var startupDelay = TimeSpan.FromSeconds(Math.Max(0, options.StartupDelaySeconds));
         if (startupDelay > TimeSpan.Zero)
         {
             await Task.Delay(startupDelay, stoppingToken);
@@ -35,6 +40,7 @@ public sealed class Worker(
 
         var factory = new MqttClientFactory();
         using var client = factory.CreateMqttClient();
+        var clientOptions = CreateClientOptions(mqtt, challenge);
 
         // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
         // The Scoreboard sends a RunTriggerMessage over MQTT to kick off each run.
@@ -56,90 +62,207 @@ public sealed class Worker(
             }
             else if (args.ApplicationMessage.Topic == Topics.RunAbort)
             {
+                logger.LogInformation("Abort signal received for team {TeamId}.", challenge.TeamId);
                 lock (_runCtsGate) { _runCts?.Cancel(); }
             }
+
+            return Task.CompletedTask;
+        };
+
+        client.DisconnectedAsync += args =>
+        {
+            _subscriptionsReady = false;
+            if (!stoppingToken.IsCancellationRequested)
+            {
+                logger.LogWarning(args.Exception, "Publisher disconnected from MQTT broker.");
+            }
+
             return Task.CompletedTask;
         };
         // ─────────────────────────────────────────────────────────────────────────
 
-        var options = new MqttClientOptionsBuilder()
-            .WithClientId($"publisher-{challenge.TeamId}")
-            .WithTcpServer(mqtt.Host, mqtt.Port)
-            .WithCleanStart()
-            .Build();
-
-        logger.LogInformation("Connecting publisher to MQTT broker {Host}:{Port}", mqtt.Host, mqtt.Port);
-        await client.ConnectAsync(options, stoppingToken);
-
-        var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
-            .WithTopicFilter(filter => filter
-                .WithTopic(Topics.RunTrigger)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
-            .WithTopicFilter(filter => filter
-                .WithTopic(Topics.RunAbort)
-                .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
-            .Build();
-
-        await client.SubscribeAsync(subscribeOptions, stoppingToken);
-        logger.LogInformation("Publisher connected and idle — waiting for a run trigger via MQTT.");
-
-        await foreach (var trigger in triggerChannel.Reader.ReadAllAsync(stoppingToken))
+        var (resumableRun, expiredRunNeedingCompletion) = await TryLoadCheckpointAsync(stoppingToken);
+        if (resumableRun is not null)
         {
+            SetActiveRun(resumableRun);
             logger.LogInformation(
-                "Received run trigger: RunId={RunId}, DeviceCount={DeviceCount}, IntervalMs={IntervalMs}, RunWindowSeconds={RunWindowSeconds}",
-                trigger.RunId, trigger.DeviceCount, trigger.IntervalMs, trigger.RunWindowSeconds);
+                "Resuming run {RunId} from checkpoint at emission {EmissionIndex} sequence {Sequence}.",
+                resumableRun.RunId,
+                resumableRun.NextEmissionIndex,
+                resumableRun.NextSequence);
+        }
 
-            var runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            lock (_runCtsGate) { _runCts = runCts; }
-            try
+        await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, stoppingToken);
+
+        if (expiredRunNeedingCompletion is not null)
+        {
+            await PublishExpiredCompletionAsync(client, clientOptions, challenge, expiredRunNeedingCompletion, stoppingToken);
+        }
+
+        if (resumableRun is not null)
+        {
+            await ExecuteActiveRunAsync(client, clientOptions, challenge, resumableRun, isResume: true, traceParent: null, stoppingToken);
+        }
+
+        logger.LogInformation("Publisher connected and idle - waiting for a run trigger via MQTT.");
+
+        var idlePollInterval = TimeSpan.FromMilliseconds(Math.Max(100, options.IdlePollIntervalMs));
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, stoppingToken);
+
+            var waitForTriggerTask = triggerChannel.Reader.WaitToReadAsync(stoppingToken).AsTask();
+            var completedTask = await Task.WhenAny(waitForTriggerTask, Task.Delay(idlePollInterval, stoppingToken));
+            if (completedTask != waitForTriggerTask)
             {
-                await ExecuteRun(client, trigger, challenge, runCts.Token, stoppingToken);
-            }
-            finally
-            {
-                lock (_runCtsGate) { _runCts = null; }
-                runCts.Dispose();
+                continue;
             }
 
-            logger.LogInformation("Run {RunId} complete — returning to idle.", trigger.RunId);
+            if (!await waitForTriggerTask)
+            {
+                break;
+            }
+
+            while (triggerChannel.Reader.TryRead(out var trigger))
+            {
+                logger.LogInformation(
+                    "Received run trigger: RunId={RunId}, DeviceCount={DeviceCount}, IntervalMs={IntervalMs}, RunWindowSeconds={RunWindowSeconds}",
+                    trigger.RunId,
+                    trigger.DeviceCount,
+                    trigger.IntervalMs,
+                    trigger.RunWindowSeconds);
+
+                var runState = CreateRunState(trigger, challenge.TeamId);
+                SetActiveRun(runState);
+                await SaveCheckpointAsync(runState, stoppingToken);
+                await ExecuteActiveRunAsync(client, clientOptions, challenge, runState, isResume: false, trigger.TraceParent, stoppingToken);
+            }
+        }
+    }
+
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        var snapshot = CloneActiveRun();
+        if (snapshot is not null && !snapshot.CompleteControlPublished)
+        {
+            await SaveCheckpointAsync(snapshot, cancellationToken);
+        }
+
+        await base.StopAsync(cancellationToken);
+    }
+
+    private async Task ExecuteActiveRunAsync(
+        IMqttClient client,
+        MqttClientOptions clientOptions,
+        ChallengeOptions challenge,
+        ActiveRunState activeRun,
+        bool isResume,
+        string? traceParent,
+        CancellationToken stoppingToken)
+    {
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        lock (_runCtsGate)
+        {
+            _runCts = runCts;
+        }
+
+        try
+        {
+            await ExecuteRun(client, clientOptions, activeRun, traceParent, isResume, challenge, runCts.Token, stoppingToken);
+        }
+        finally
+        {
+            lock (_runCtsGate)
+            {
+                _runCts = null;
+            }
+
+            if (stoppingToken.IsCancellationRequested)
+            {
+                var snapshot = CloneActiveRun();
+                if (snapshot is not null && !snapshot.CompleteControlPublished)
+                {
+                    await SaveCheckpointAsync(snapshot, stoppingToken);
+                }
+            }
+
+            if (CloneActiveRun()?.CompleteControlPublished is true)
+            {
+                ClearActiveRun();
+            }
         }
     }
 
     private async Task ExecuteRun(
         IMqttClient client,
-        RunTriggerMessage trigger,
+        MqttClientOptions clientOptions,
+        ActiveRunState activeRun,
+        string? traceParent,
+        bool isResume,
         ChallengeOptions challenge,
         CancellationToken runToken,
         CancellationToken stoppingToken)
     {
+            if (isResume)
+            {
+                logger.LogInformation(
+                    "Resuming run {RunId} with next emission {NextEmissionIndex} and sequence {NextSequence}.",
+                    activeRun.RunId,
+                    activeRun.NextEmissionIndex,
+                    activeRun.NextSequence);
+            }
+            else
+            {
+                logger.LogInformation(
+                    "Starting run {RunId} with {DeviceCount} devices, interval {IntervalMs} ms, run length {RunWindowSeconds} s.",
+                    activeRun.RunId,
+                    activeRun.DeviceCount,
+                    activeRun.IntervalMs,
+                    activeRun.RunWindowSeconds);
+            }
+
         ActivityContext parentContext = default;
-        bool hasParent = !string.IsNullOrEmpty(trigger.TraceParent)
-            && ActivityContext.TryParse(trigger.TraceParent, null, isRemote: true, out parentContext);
+        bool hasParent = !string.IsNullOrEmpty(traceParent)
+            && ActivityContext.TryParse(traceParent, null, isRemote: true, out parentContext);
 
         using var activity = TelemetryActivitySources.Publisher.StartActivity(
             "run.execute",
             ActivityKind.Consumer,
             hasParent ? parentContext : default);
-        activity?.SetTag("run.id", trigger.RunId);
+        activity?.SetTag("run.id", activeRun.RunId);
 
-        var intervalMs = trigger.IntervalMs;
-        var deviceCount = Math.Max(1, trigger.DeviceCount);
-        var runWindowSeconds = Math.Max(1, trigger.RunWindowSeconds);
-        var messagesPerDevice = RunMath.CalculateMessagesPerDevice(runWindowSeconds, intervalMs);
-        var theoreticalTotalMessages = RunMath.CalculateTheoreticalTelemetryCount(deviceCount, runWindowSeconds, intervalMs);
-        var runId = trigger.RunId;
-        var runStartedAtUtc = DateTimeOffset.UtcNow;
-        var runEndsAtUtc = runStartedAtUtc.AddSeconds(runWindowSeconds);
+        var messagesPerDevice = RunMath.CalculateMessagesPerDevice(activeRun.RunWindowSeconds, activeRun.IntervalMs);
+        var theoreticalTotalMessages = RunMath.CalculateTheoreticalTelemetryCount(activeRun.DeviceCount, activeRun.RunWindowSeconds, activeRun.IntervalMs);
         long publishedCount = 0;
-        long sequence = 1;
+        var deviceIds = Enumerable.Range(1, activeRun.DeviceCount)
+            .Select(deviceNumber => $"device-{deviceNumber:000}")
+            .ToArray();
+        var telemetryTopic = Topics.TelemetryRaw(activeRun.RunId, activeRun.TeamId);
+        var checkpointEveryEmissions = Math.Max(1, publisherOptions.Value.CheckpointEveryEmissions);
+
+        await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, stoppingToken);
 
         // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
         // Signals the Judge and Scoreboard that this team's Publisher has started.
         // The Scoreboard transitions from Pending → Running on receipt of this message.
-        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherStart, stoppingToken, deviceCount, intervalMs, runWindowSeconds);
+        if (!activeRun.StartControlPublished)
+        {
+            await PublishControlAsync(
+                client,
+                clientOptions,
+                challenge,
+                activeRun.RunId,
+                activeRun.TeamId,
+                Topics.PublisherStart,
+                stoppingToken,
+                activeRun.DeviceCount,
+                activeRun.IntervalMs,
+                activeRun.RunWindowSeconds);
+            activeRun.StartControlPublished = true;
+            SetActiveRun(activeRun);
+            await SaveCheckpointAsync(activeRun, stoppingToken);
+        }
         // ─────────────────────────────────────────────────────────────────────────
-
-        var telemetryTopic = Topics.TelemetryRaw(runId, challenge.TeamId);
 
         // ── YOUR CODE ─────────────────────────────────────────────────────────────
         // Improve this loop to maximise your score:
@@ -147,9 +270,9 @@ public sealed class Worker(
         //   - Tune the `value` formula (the Judge doesn't care what values you emit,
         //     but consistency helps when debugging aggregate correctness)
         //   - Parallelise per-device publishing if you want to push interval lower
-        for (var emissionIndex = 0; emissionIndex < messagesPerDevice; emissionIndex++)
+        for (var emissionIndex = activeRun.NextEmissionIndex; emissionIndex < messagesPerDevice; emissionIndex++)
         {
-            var scheduledAtUtc = runStartedAtUtc.AddMilliseconds((long)emissionIndex * intervalMs);
+            var scheduledAtUtc = activeRun.RunStartedAtUtc.AddMilliseconds((long)emissionIndex * activeRun.IntervalMs);
             var delay = scheduledAtUtc - DateTimeOffset.UtcNow;
             if (delay > TimeSpan.Zero)
             {
@@ -160,7 +283,7 @@ public sealed class Worker(
                 catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
                 {
                     // Run was aborted via stop signal — exit the emission loop early.
-                    logger.LogInformation("Run {RunId} aborted — stopping emission early at index {Index}.", runId, emissionIndex);
+                    logger.LogInformation("Run {RunId} aborted - stopping emission early at index {Index}.", activeRun.RunId, emissionIndex);
                     break;
                 }
             }
@@ -168,47 +291,102 @@ public sealed class Worker(
             if (runToken.IsCancellationRequested)
                 break;
 
-            if (DateTimeOffset.UtcNow >= runEndsAtUtc)
+            if (DateTimeOffset.UtcNow >= activeRun.RunEndsAtUtc)
             {
                 logger.LogWarning(
                     "Run {RunId} ended before all scheduled emissions could be sent. Published={PublishedCount}, Theoretical={TheoreticalTotalMessages}",
-                    runId,
+                    activeRun.RunId,
                     publishedCount,
                     theoreticalTotalMessages);
                 break;
             }
 
-            for (var deviceNumber = 1; deviceNumber <= deviceCount; deviceNumber++)
+            foreach (var deviceId in deviceIds)
             {
+                await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, stoppingToken);
+
                 var publishedAtUtc = DateTimeOffset.UtcNow;
                 var telemetry = new TelemetryMessage(
                     Topics.SchemaVersion,
-                    runId,
-                    challenge.TeamId,
-                    $"device-{deviceNumber:000}",
-                    sequence++,
+                    activeRun.RunId,
+                    activeRun.TeamId,
+                    deviceId,
+                    activeRun.NextSequence++,
                     scheduledAtUtc,
                     publishedAtUtc,
-                    40 + deviceNumber + emissionIndex / 10.0);
+                    40 + Array.IndexOf(deviceIds, deviceId) + 1 + emissionIndex / 10.0);
 
                 var telemetryJson = JsonSerializer.Serialize(telemetry, JsonContract.Options);
-                await PublishJson(client, telemetryTopic, telemetryJson, stoppingToken);
+                await PublishJsonAsync(client, clientOptions, challenge, telemetryTopic, telemetryJson, stoppingToken);
                 publishedCount++;
-                TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", challenge.TeamId));
+                TelemetryPublished.Add(1, new KeyValuePair<string, object?>("team_id", activeRun.TeamId));
+            }
+
+            activeRun.NextEmissionIndex = emissionIndex + 1;
+            SetActiveRun(activeRun);
+            if (activeRun.NextEmissionIndex % checkpointEveryEmissions == 0)
+            {
+                await SaveCheckpointAsync(activeRun, stoppingToken);
             }
         }
         // ─────────────────────────────────────────────────────────────────────────
 
+        if (stoppingToken.IsCancellationRequested)
+        {
+            await SaveCheckpointAsync(activeRun, stoppingToken);
+            return;
+        }
+
         // ── BOILERPLATE: DO NOT REMOVE ────────────────────────────────────────────
         // Signals the Judge and Scoreboard that this run is complete.
         // The Scoreboard transitions from Running → Idle on receipt of this message.
-        await PublishControl(client, runId, challenge.TeamId, Topics.PublisherComplete, stoppingToken,
-            traceParent: activity?.Id);
+        if (!activeRun.CompleteControlPublished)
+        {
+            await PublishControlAsync(
+                client,
+                clientOptions,
+                challenge,
+                activeRun.RunId,
+                activeRun.TeamId,
+                Topics.PublisherComplete,
+                stoppingToken,
+                traceParent: activity?.Id);
+            activeRun.CompleteControlPublished = true;
+            SetActiveRun(activeRun);
+            await DeleteCheckpointAsync(stoppingToken);
+        }
         // ─────────────────────────────────────────────────────────────────────────
+
+        logger.LogInformation(
+            "Run {RunId} complete - published {PublishedCount} messages of theoretical {TheoreticalTotalMessages}.",
+            activeRun.RunId,
+            publishedCount,
+            theoreticalTotalMessages);
     }
 
-    private static Task PublishControl(
+    private async Task PublishExpiredCompletionAsync(
         IMqttClient client,
+        MqttClientOptions clientOptions,
+        ChallengeOptions challenge,
+        ActiveRunState expiredRun,
+        CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Checkpointed run {RunId} has already expired; sending best-effort completion.", expiredRun.RunId);
+        await PublishControlAsync(
+            client,
+            clientOptions,
+            challenge,
+            expiredRun.RunId,
+            expiredRun.TeamId,
+            Topics.PublisherComplete,
+            cancellationToken);
+        await DeleteCheckpointAsync(cancellationToken);
+    }
+
+    private async Task PublishControlAsync(
+        IMqttClient client,
+        MqttClientOptions clientOptions,
+        ChallengeOptions challenge,
         string runId,
         string teamId,
         string eventName,
@@ -233,24 +411,246 @@ public sealed class Worker(
 
         var topic = Topics.Control(runId, teamId, eventName);
         var json = JsonSerializer.Serialize(control, JsonContract.Options);
-        var publishTask = PublishJson(client, topic, json, cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
+        await PublishJsonAsync(client, clientOptions, challenge, topic, json, cancellationToken, MqttQualityOfServiceLevel.AtLeastOnce);
         ControlPublished.Add(1, new KeyValuePair<string, object?>("event", eventName));
-        return publishTask;
     }
 
-    private static Task PublishJson(
+    private async Task PublishJsonAsync(
         IMqttClient client,
+        MqttClientOptions clientOptions,
+        ChallengeOptions challenge,
         string topic,
         string json,
         CancellationToken cancellationToken,
         MqttQualityOfServiceLevel qualityOfServiceLevel = MqttQualityOfServiceLevel.AtMostOnce)
     {
+        await EnsureConnectedAndSubscribedAsync(client, clientOptions, challenge, cancellationToken);
+
         var message = new MqttApplicationMessageBuilder()
             .WithTopic(topic)
             .WithPayload(json)
             .WithQualityOfServiceLevel(qualityOfServiceLevel)
             .Build();
 
-        return client.PublishAsync(message, cancellationToken);
+        await client.PublishAsync(message, cancellationToken);
+    }
+
+    private async Task EnsureConnectedAndSubscribedAsync(
+        IMqttClient client,
+        MqttClientOptions clientOptions,
+        ChallengeOptions challenge,
+        CancellationToken cancellationToken)
+    {
+        if (client.IsConnected && _subscriptionsReady)
+        {
+            return;
+        }
+
+        var attempt = 0;
+        var reconnectDelayMs = Math.Max(50, publisherOptions.Value.ReconnectInitialDelayMs);
+        var reconnectMaxDelayMs = Math.Max(reconnectDelayMs, publisherOptions.Value.ReconnectMaxDelayMs);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (!client.IsConnected)
+                {
+                    logger.LogInformation(
+                        attempt == 0
+                            ? "Connecting publisher to MQTT broker {Host}:{Port}"
+                            : "Reconnect attempt {Attempt} to MQTT broker {Host}:{Port}",
+                        mqttOptions.Value.Host,
+                        mqttOptions.Value.Port,
+                        attempt);
+                    await client.ConnectAsync(clientOptions, cancellationToken);
+                    logger.LogInformation("Publisher connected to MQTT broker.");
+                }
+
+                var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
+                    .WithTopicFilter(filter => filter
+                        .WithTopic(Topics.RunTrigger)
+                        .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
+                    .WithTopicFilter(filter => filter
+                        .WithTopic(Topics.RunAbort)
+                        .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.AtLeastOnce))
+                    .Build();
+
+                await client.SubscribeAsync(subscribeOptions, cancellationToken);
+                _subscriptionsReady = true;
+                if (attempt > 0)
+                {
+                    logger.LogInformation("Publisher resubscribed after reconnect.");
+                }
+
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                attempt++;
+                _subscriptionsReady = false;
+                logger.LogWarning(ex, "Publisher connect attempt {Attempt} failed; retrying.", attempt);
+                await Task.Delay(TimeSpan.FromMilliseconds(reconnectDelayMs), cancellationToken);
+                reconnectDelayMs = Math.Min(reconnectDelayMs * 2, reconnectMaxDelayMs);
+            }
+        }
+    }
+
+    private MqttClientOptions CreateClientOptions(MqttOptions mqtt, ChallengeOptions challenge)
+    {
+        return new MqttClientOptionsBuilder()
+            .WithClientId($"publisher-{challenge.TeamId}")
+            .WithTcpServer(mqtt.Host, mqtt.Port)
+            .WithCleanStart()
+            .Build();
+    }
+
+    private static ActiveRunState CreateRunState(RunTriggerMessage trigger, string teamId)
+    {
+        var runStartedAtUtc = DateTimeOffset.UtcNow;
+        return new ActiveRunState
+        {
+            RunId = trigger.RunId,
+            TeamId = teamId,
+            DeviceCount = Math.Max(1, trigger.DeviceCount),
+            IntervalMs = Math.Max(1, trigger.IntervalMs),
+            RunWindowSeconds = Math.Max(1, trigger.RunWindowSeconds),
+            RunStartedAtUtc = runStartedAtUtc,
+            RunEndsAtUtc = runStartedAtUtc.AddSeconds(Math.Max(1, trigger.RunWindowSeconds)),
+            NextSequence = 1,
+            NextEmissionIndex = 0
+        };
+    }
+
+    private string GetCheckpointPath()
+        => Path.Combine(Environment.CurrentDirectory, publisherOptions.Value.CheckpointFileName);
+
+    private async Task<(ActiveRunState? ResumableRun, ActiveRunState? ExpiredRunNeedingCompletion)> TryLoadCheckpointAsync(CancellationToken cancellationToken)
+    {
+        var checkpointPath = GetCheckpointPath();
+        if (!File.Exists(checkpointPath))
+        {
+            return (null, null);
+        }
+
+        try
+        {
+            var json = await File.ReadAllTextAsync(checkpointPath, cancellationToken);
+            var checkpoint = JsonSerializer.Deserialize<ActiveRunState>(json, JsonContract.Options);
+            if (checkpoint is null)
+            {
+                return (null, null);
+            }
+
+            logger.LogInformation("Loaded publisher checkpoint for run {RunId}.", checkpoint.RunId);
+            if (!checkpoint.CompleteControlPublished && checkpoint.StartControlPublished && DateTimeOffset.UtcNow >= checkpoint.RunEndsAtUtc)
+            {
+                return (null, checkpoint);
+            }
+
+            if (DateTimeOffset.UtcNow < checkpoint.RunEndsAtUtc && !checkpoint.CompleteControlPublished)
+            {
+                return (checkpoint, null);
+            }
+
+            await DeleteCheckpointAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException)
+        {
+            logger.LogWarning(ex, "Failed to load publisher checkpoint; ignoring it.");
+        }
+
+        return (null, null);
+    }
+
+    private async Task SaveCheckpointAsync(ActiveRunState runState, CancellationToken cancellationToken)
+    {
+        var checkpointPath = GetCheckpointPath();
+        var json = JsonSerializer.Serialize(runState, JsonContract.Options);
+        var tempPath = $"{checkpointPath}.tmp";
+        await File.WriteAllTextAsync(tempPath, json, cancellationToken);
+        File.Move(tempPath, checkpointPath, overwrite: true);
+        logger.LogDebug("Saved publisher checkpoint for run {RunId} at emission {EmissionIndex}.", runState.RunId, runState.NextEmissionIndex);
+    }
+
+    private Task DeleteCheckpointAsync(CancellationToken cancellationToken)
+    {
+        var checkpointPath = GetCheckpointPath();
+        if (File.Exists(checkpointPath))
+        {
+            File.Delete(checkpointPath);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void SetActiveRun(ActiveRunState runState)
+    {
+        lock (_stateGate)
+        {
+            _activeRun = runState.Clone();
+        }
+    }
+
+    private ActiveRunState? CloneActiveRun()
+    {
+        lock (_stateGate)
+        {
+            return _activeRun?.Clone();
+        }
+    }
+
+    private void ClearActiveRun()
+    {
+        lock (_stateGate)
+        {
+            _activeRun = null;
+        }
+    }
+
+    private sealed class ActiveRunState
+    {
+        public string RunId { get; init; } = string.Empty;
+
+        public string TeamId { get; init; } = string.Empty;
+
+        public int DeviceCount { get; init; }
+
+        public int IntervalMs { get; init; }
+
+        public int RunWindowSeconds { get; init; }
+
+        public DateTimeOffset RunStartedAtUtc { get; init; }
+
+        public DateTimeOffset RunEndsAtUtc { get; init; }
+
+        public long NextSequence { get; set; }
+
+        public int NextEmissionIndex { get; set; }
+
+        public bool StartControlPublished { get; set; }
+
+        public bool CompleteControlPublished { get; set; }
+
+        public ActiveRunState Clone()
+        {
+            return new ActiveRunState
+            {
+                RunId = RunId,
+                TeamId = TeamId,
+                DeviceCount = DeviceCount,
+                IntervalMs = IntervalMs,
+                RunWindowSeconds = RunWindowSeconds,
+                RunStartedAtUtc = RunStartedAtUtc,
+                RunEndsAtUtc = RunEndsAtUtc,
+                NextSequence = NextSequence,
+                NextEmissionIndex = NextEmissionIndex,
+                StartControlPublished = StartControlPublished,
+                CompleteControlPublished = CompleteControlPublished
+            };
+        }
     }
 }
