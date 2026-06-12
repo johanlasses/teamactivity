@@ -13,6 +13,7 @@ This repository is the operator/developer reference for the **MQTT AI Battle** h
 ## Run
 
 ```bash
+aspire certs trust (first time only)
 aspire start
 ```
 
