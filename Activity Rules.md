@@ -73,6 +73,12 @@ git clone https://github.com/johanlasses/teamactivity.git
 ```
 
 **Start:**
+
+First time you need to trust the dev certs. If you run Linux look [here](https://aspire.dev/app-host/certificate-configuration/)
+```bash
+aspire certs trust
+```
+From now on you can start the stack with this command.
 ```bash
 aspire start
 ```
